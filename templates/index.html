@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>233战法扫描系统</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --card: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --text-dim: #8b949e;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+  --orange: #db6d28;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, 'SF Mono', 'Menlo', monospace;
+  font-size: 14px;
+  min-height: 100vh;
+}
+.header {
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.header h1 { font-size: 18px; font-weight: 700; letter-spacing: 1px; }
+.header .badge {
+  background: var(--border);
+  color: var(--text-dim);
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+}
+.header .badge.active { background: rgba(63,185,80,0.2); color: var(--green); }
+.header .badge.inactive { background: rgba(139,148,158,0.15); color: var(--text-dim); }
+.header .time { color: var(--text-dim); font-size: 13px; margin-left: auto; }
+
+.container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+/* 任务控制区 */
+.controls {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.btn {
+  padding: 10px 20px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn.run-pre { border-color: var(--accent); color: var(--accent); }
+.btn.run-intraday { border-color: var(--orange); color: var(--orange); }
+.btn .spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Tabs */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  padding: 8px 16px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 14px;
+}
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab:hover { color: var(--text); }
+.tab .count { font-size: 11px; background: var(--border); padding: 1px 6px; border-radius: 8px; margin-left: 4px; }
+
+/* Card */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.card-header {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.card-header h3 { font-size: 13px; font-weight: 700; }
+.card-header .meta { color: var(--text-dim); font-size: 12px; margin-left: auto; }
+
+/* Table */
+table { width: 100%; border-collapse: collapse; }
+th {
+  text-align: left;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+td {
+  padding: 8px 12px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+tr:hover td { background: rgba(88,166,255,0.05); }
+.text-right { text-align: right; }
+.positive { color: var(--red); }
+.negative { color: var(--green); }
+.star { color: var(--yellow); font-size: 15px; }
+
+/* 日志 */
+.log-box {
+  background: #0a0e14;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  max-height: 300px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.log-box .line { white-space: pre-wrap; word-break: break-all; }
+.log-box .line.error { color: var(--red); }
+.log-box .line.success { color: var(--green); }
+
+/* 配置 */
+.config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+.config-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.config-item label {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  min-width: 120px;
+}
+.config-item input {
+  background: #0a0e14;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  width: 100%;
+  font-family: inherit;
+}
+.config-item input:focus { border-color: var(--accent); outline: none; }
+
+.empty { color: var(--text-dim); text-align: center; padding: 40px; font-size: 14px; }
+.hidden { display: none; }
+
+/* 买点条件 */
+.cond-grid { display: flex; gap: 6px; }
+.cond {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+}
+.cond.y { background: rgba(63,185,80,0.2); color: var(--green); }
+.cond.n { background: rgba(248,81,73,0.15); color: var(--red); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>233战法扫描系统</h1>
+  <span class="badge" id="trading-badge">检查中</span>
+  <span class="time" id="now-time">--:--:--</span>
+</div>
+
+<div class="container">
+
+  <!-- 控制区 -->
+  <div class="controls">
+    <button class="btn run-pre" id="btn-pre" onclick="runTask('pre')">
+      盘前筛选
+    </button>
+    <button class="btn run-intraday" id="btn-intraday" onclick="runTask('intraday')">
+      盘中扫描
+    </button>
+    <button class="btn" onclick="refreshAll()">刷新数据</button>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" data-tab="pool" onclick="switchTab('pool')">
+      核心股池 <span class="count" id="pool-count">0</span>
+    </div>
+    <div class="tab" data-tab="scan" onclick="switchTab('scan')">
+      盘中扫描 <span class="count" id="scan-count">0</span>
+    </div>
+    <div class="tab" data-tab="log" onclick="switchTab('log')">
+      运行日志
+    </div>
+    <div class="tab" data-tab="config" onclick="switchTab('config')">
+      参数配置
+    </div>
+    <div class="tab" data-tab="history" onclick="switchTab('history'); loadHistory()">
+      历史记录
+    </div>
+  </div>
+
+  <!-- 核心股池 -->
+  <div id="tab-pool" class="tab-content">
+    <div class="card">
+      <div class="card-header">
+        <h3>核心股池</h3>
+        <span class="meta" id="pool-time"></span>
+      </div>
+      <div id="pool-body">
+        <div class="empty">点击「盘前筛选」生成核心股池</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 盘中扫描 -->
+  <div id="tab-scan" class="tab-content hidden">
+    <div class="card">
+      <div class="card-header">
+        <h3>盘中扫描结果</h3>
+        <span class="meta" id="scan-time"></span>
+      </div>
+      <div id="scan-body">
+        <div class="empty">点击「盘中扫描」启动扫描</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 日志 -->
+  <div id="tab-log" class="tab-content hidden">
+    <div class="card">
+      <div class="card-header">
+        <h3>盘前筛选日志</h3>
+        <button class="btn" style="padding:2px 10px;font-size:12px" onclick="switchLog('pre')">盘前</button>
+        <button class="btn" style="padding:2px 10px;font-size:12px" onclick="switchLog('intraday')">盘中</button>
+      </div>
+      <div class="log-box" id="log-body">
+        <div class="empty">暂无日志</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 配置 -->
+  <div id="tab-config" class="tab-content hidden">
+    <div class="card">
+      <div class="card-header">
+        <h3>参数配置</h3>
+        <button class="btn" style="padding:4px 12px;font-size:12px;margin-left:auto" onclick="saveConfig()">保存</button>
+      </div>
+      <div style="padding:16px">
+        <div class="config-grid" id="config-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 历史记录 -->
+  <div id="tab-history" class="tab-content hidden">
+    <div style="display:flex;gap:12px">
+      <div class="card" style="width:280px;flex-shrink:0">
+        <div class="card-header"><h3>历史存档</h3><span class="meta" id="history-count"></span></div>
+        <div id="history-list" style="max-height:600px;overflow-y:auto">
+          <div class="empty">暂无历史记录</div>
+        </div>
+      </div>
+      <div class="card" style="flex:1;min-width:0">
+        <div class="card-header">
+          <h3 id="history-detail-title">选择左侧记录查看详情</h3>
+          <span class="meta" id="history-detail-meta"></span>
+        </div>
+        <div id="history-detail-body">
+          <div class="empty">点击左侧任意一条历史记录</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let currentLog = 'pre';
+let statusTimer = null;
+
+function fmtAmount(a) {
+  if (!a || a <= 0) return '-';
+  if (a >= 1e8) return (a/1e8).toFixed(1) + '亿';
+  if (a >= 1e4) return (a/1e4).toFixed(1) + '万';
+  return a.toFixed(0);
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.tab[data-tab="${name}"]`).classList.add('active');
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+  document.getElementById(`tab-${name}`).classList.remove('hidden');
+}
+
+function switchLog(type) {
+  currentLog = type;
+  updateStatus();
+}
+
+async function runTask(type) {
+  const url = type === 'pre' ? '/api/run/pre' : '/api/run/intraday';
+  const btn = document.getElementById(type === 'pre' ? 'btn-pre' : 'btn-intraday');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>运行中';
+
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) { alert(d.msg); btn.disabled = false; btn.innerHTML = type === 'pre' ? '盘前筛选' : '盘中扫描'; return; }
+    startStatusPoll();
+  } catch(e) {
+    alert('请求失败: ' + e);
+    btn.disabled = false;
+    btn.innerHTML = type === 'pre' ? '盘前筛选' : '盘中扫描';
+  }
+}
+
+function startStatusPoll() {
+  if (statusTimer) return;
+  statusTimer = setInterval(updateStatus, 2000);
+  updateStatus();
+}
+
+async function updateStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+
+    // 更新时间
+    document.getElementById('now-time').textContent = d.now;
+
+    // 按钮状态
+    const preRunning = d.pre_market.running;
+    const intraRunning = d.intraday.running;
+    const btnPre = document.getElementById('btn-pre');
+    const btnIntra = document.getElementById('btn-intraday');
+    btnPre.disabled = preRunning;
+    btnPre.innerHTML = preRunning ? '<span class="spinner"></span>运行中' : '盘前筛选';
+    btnIntra.disabled = intraRunning;
+    btnIntra.innerHTML = intraRunning ? '<span class="spinner"></span>运行中' : '盘中扫描';
+
+    // 日志
+    const logData = currentLog === 'pre' ? d.pre_market : d.intraday;
+    const logBox = document.getElementById('log-body');
+    if (logData.log_tail && logData.log_tail.length > 0) {
+      logBox.innerHTML = logData.log_tail.map(l => {
+        let cls = 'line';
+        if (l.includes('错误') || l.includes('失败')) cls += ' error';
+        if (l.includes('保存') || l.includes('完成')) cls += ' success';
+        return `<div class="${cls}">${l}</div>`;
+      }).join('');
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    // 盘前结果
+    if (d.pre_market.result) {
+      renderPool(d.pre_market.result);
+    }
+    if (d.pre_market.error) {
+      const body = document.getElementById('pool-body');
+      body.innerHTML = `<div class="empty" style="color:var(--red)">错误: ${d.pre_market.error}</div>`;
+    }
+
+    // 盘中结果
+    if (d.intraday.result) {
+      renderScan(d.intraday.result);
+    }
+    if (d.intraday.error) {
+      const body = document.getElementById('scan-body');
+      body.innerHTML = `<div class="empty" style="color:var(--red)">错误: ${d.intraday.error}</div>`;
+    }
+
+    // 停止轮询
+    if (!preRunning && !intraRunning) {
+      clearInterval(statusTimer);
+      statusTimer = null;
+    }
+  } catch(e) { console.error(e); }
+}
+
+function renderPool(data) {
+  document.getElementById('pool-count').textContent = data.count;
+  document.getElementById('pool-time').textContent = '生成时间: ' + data.time;
+  const body = document.getElementById('pool-body');
+  if (!data.stocks || data.stocks.length === 0) {
+    body.innerHTML = '<div class="empty">无符合条件的标的</div>';
+    return;
+  }
+  let html = `<table><thead><tr>
+    <th>排名</th><th>代码</th><th>名称</th><th>板块</th><th>涨停</th><th>连板</th>
+    <th>红绿比</th><th>量比</th><th>换手%</th><th>成交额</th><th>评分</th>
+  </tr></thead><tbody>`;
+  data.stocks.forEach((s, i) => {
+    html += `<tr>
+      <td>${i+1}</td>
+      <td>${s.code}</td>
+      <td>${s.name}</td>
+      <td style="color:var(--text-dim)">${s.sector||'-'}</td>
+      <td style="color:var(--red)">${s.zt_count}</td>
+      <td>${s.max_consecutive}</td>
+      <td>${s.red_green_ratio?.toFixed(1)||'-'}</td>
+      <td>${s.volume_ratio?.toFixed(2)||'-'}</td>
+      <td>${s.turnover_rate?.toFixed(1)||'-'}</td>
+      <td>${fmtAmount(s.amount)}</td>
+      <td style="color:var(--accent);font-weight:700">${s.score?.toFixed(1)||'-'}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  body.innerHTML = html;
+}
+
+function renderScan(data) {
+  document.getElementById('scan-count').textContent = data.count;
+  document.getElementById('scan-time').textContent = '扫描时间: ' + data.time;
+  const body = document.getElementById('scan-body');
+  if (!data.results || data.results.length === 0) {
+    body.innerHTML = '<div class="empty">强势板块中无核心股池标的匹配，继续观察</div>';
+    return;
+  }
+  const confirmed = data.results.filter(r => r.all_confirmed);
+  let html = '';
+  if (confirmed.length > 0) {
+    html += `<div style="padding:10px 16px;background:rgba(63,185,80,0.1);border-bottom:1px solid var(--border)">
+      <span style="color:var(--green);font-weight:700;font-size:16px">★ ${confirmed.length}只标的四条件共振确认</span></div>`;
+  }
+  html += `<table><thead><tr>
+    <th>代码</th><th>名称</th><th>板块</th><th>涨幅%</th><th>板块涨%</th>
+    <th>量比</th><th>换手%</th><th>涨停基因</th>
+    <th>板块涨</th><th>核心动</th><th>量能放</th><th>突破</th><th>共振</th>
+  </tr></thead><tbody>`;
+  data.results.forEach(r => {
+    const cond = (b) => `<div class="cond ${b?'y':'n'}">${b?'Y':'N'}</div>`;
+    html += `<tr>
+      <td>${r.stock_code}</td>
+      <td>${r.stock_name}</td>
+      <td style="color:var(--text-dim)">${r.sector_name}</td>
+      <td class="positive">${r.stock_change?.toFixed(2)}</td>
+      <td class="positive">${r.sector_change?.toFixed(2)}</td>
+      <td>${r.volume_ratio?.toFixed(1)}</td>
+      <td>${r.turnover_rate?.toFixed(1)}</td>
+      <td>${r.zt_gene}次</td>
+      <td>${cond(r.cond_sector)}</td>
+      <td>${cond(r.cond_stock)}</td>
+      <td>${cond(r.cond_volume)}</td>
+      <td>${cond(r.cond_breakout)}</td>
+      <td>${r.all_confirmed ? '<span class="star">★</span>' : ''}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  body.innerHTML = html;
+}
+
+async function loadConfig() {
+  const r = await fetch('/api/config');
+  const d = await r.json();
+  const grid = document.getElementById('config-grid');
+  const keys = Object.keys(d).sort();
+  grid.innerHTML = keys.map(k => {
+    const v = d[k];
+    const isList = Array.isArray(v);
+    return `<div class="config-item">
+      <label>${k}</label>
+      <input type="text" data-key="${k}" value='${isList ? JSON.stringify(v) : v}'>
+    </div>`;
+  }).join('');
+}
+
+async function saveConfig() {
+  const inputs = document.querySelectorAll('#config-grid input');
+  const data = {};
+  inputs.forEach(i => { data[i.dataset.key] = i.value; });
+  const r = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+  const d = await r.json();
+  if (d.ok) alert('配置已保存');
+}
+
+async function refreshAll() {
+  // 刷新股池
+  try {
+    const r = await fetch('/api/pool');
+    const d = await r.json();
+    if (d.stocks && d.stocks.length > 0) renderPool(d);
+    else document.getElementById('pool-body').innerHTML = '<div class="empty">暂无股池数据，请先运行盘前筛选</div>';
+  } catch(e) {}
+
+  // 刷新状态
+  updateStatus();
+}
+
+// ==================== 历史记录 ====================
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/history');
+    const d = await r.json();
+    const listEl = document.getElementById('history-list');
+    document.getElementById('history-count').textContent = (d.length || 0) + '条';
+
+    if (!d || d.length === 0) {
+      listEl.innerHTML = '<div class="empty">暂无历史记录<br><span style="font-size:12px;color:var(--text-dim)">运行盘前筛选或盘中扫描后自动存档</span></div>';
+      return;
+    }
+
+    listEl.innerHTML = d.map(item => {
+      const isPool = item.type === 'pool';
+      const icon = isPool ? '🔵' : '🟠';
+      const label = isPool ? '股池' : '扫描';
+      const dateStr = item.date || '';
+      const timeStr = item.time || '';
+      return `<div class="history-item" style="padding:8px 12px;border-bottom:1px solid var(--border);cursor:pointer;transition:background 0.15s"
+        onclick="loadHistoryDetail('${item.filename}')"
+        onmouseover="this.style.background='rgba(88,166,255,0.08)'"
+        onmouseout="this.style.background=''">
+        <div style="display:flex;align-items:center;gap:6px">
+          <span>${icon}</span>
+          <span style="font-weight:600">${label}</span>
+          <span style="color:var(--text-dim);font-size:12px">${dateStr}</span>
+        </div>
+        <div style="font-size:12px;color:var(--text-dim);margin-top:2px">
+          ${timeStr} · ${item.count}只
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('history-list').innerHTML = `<div class="empty" style="color:var(--red)">加载失败: ${e}</div>`;
+  }
+}
+
+async function loadHistoryDetail(filename) {
+  try {
+    const r = await fetch('/api/history/' + filename);
+    const d = await r.json();
+    const isPool = filename.includes('pool');
+    const title = isPool ? '核心股池' : '盘中扫描';
+    document.getElementById('history-detail-title').textContent = `${title} - ${d.date || ''}`;
+    document.getElementById('history-detail-meta').textContent = d.time ? `${d.time} · ${d.count}只` : '';
+
+    const body = document.getElementById('history-detail-body');
+    const stocks = d.stocks || d.results || [];
+    if (stocks.length === 0) {
+      body.innerHTML = '<div class="empty">该记录无数据</div>';
+      return;
+    }
+
+    if (isPool) {
+      let html = `<table><thead><tr>
+        <th>排名</th><th>代码</th><th>名称</th><th>板块</th><th>涨停</th><th>连板</th>
+        <th>红绿比</th><th>量比</th><th>换手%</th><th>成交额</th><th>评分</th>
+      </tr></thead><tbody>`;
+      stocks.forEach((s, i) => {
+        html += `<tr>
+          <td>${i+1}</td>
+          <td>${s.code||'-'}</td>
+          <td>${s.name||'-'}</td>
+          <td style="color:var(--text-dim)">${s.sector||'-'}</td>
+          <td style="color:var(--red)">${s.zt_count||'-'}</td>
+          <td>${s.max_consecutive||'-'}</td>
+          <td>${s.red_green_ratio!=null?s.red_green_ratio.toFixed(1):'-'}</td>
+          <td>${s.volume_ratio!=null?s.volume_ratio.toFixed(2):'-'}</td>
+          <td>${s.turnover_rate!=null?s.turnover_rate.toFixed(1):'-'}</td>
+          <td>${fmtAmount(s.amount)}</td>
+          <td style="color:var(--accent);font-weight:700">${s.score!=null?s.score.toFixed(1):'-'}</td>
+        </tr>`;
+      });
+      html += '</tbody></table>';
+      body.innerHTML = html;
+    } else {
+      const confirmed = stocks.filter(r => r.all_confirmed);
+      let html = '';
+      if (confirmed.length > 0) {
+        html += `<div style="padding:10px 16px;background:rgba(63,185,80,0.1);border-bottom:1px solid var(--border)">
+          <span style="color:var(--green);font-weight:700">★ ${confirmed.length}只标的四条件共振确认</span></div>`;
+      }
+      html += `<table><thead><tr>
+        <th>代码</th><th>名称</th><th>板块</th><th>涨幅%</th><th>板块涨%</th>
+        <th>量比</th><th>换手%</th><th>涨停基因</th>
+        <th>板块涨</th><th>核心动</th><th>量能放</th><th>突破</th><th>共振</th>
+      </tr></thead><tbody>`;
+      stocks.forEach(r => {
+        const cond = (b) => `<div class="cond ${b?'y':'n'}">${b?'Y':'N'}</div>`;
+        html += `<tr>
+          <td>${r.stock_code||'-'}</td>
+          <td>${r.stock_name||'-'}</td>
+          <td style="color:var(--text-dim)">${r.sector_name||'-'}</td>
+          <td class="positive">${r.stock_change!=null?r.stock_change.toFixed(2):'-'}</td>
+          <td class="positive">${r.sector_change!=null?r.sector_change.toFixed(2):'-'}</td>
+          <td>${r.volume_ratio!=null?r.volume_ratio.toFixed(1):'-'}</td>
+          <td>${r.turnover_rate!=null?r.turnover_rate.toFixed(1):'-'}</td>
+          <td>${r.zt_gene||0}次</td>
+          <td>${cond(r.cond_sector)}</td>
+          <td>${cond(r.cond_stock)}</td>
+          <td>${cond(r.cond_volume)}</td>
+          <td>${cond(r.cond_breakout)}</td>
+          <td>${r.all_confirmed ? '<span class="star">★</span>' : ''}</td>
+        </tr>`;
+      });
+      html += '</tbody></table>';
+      body.innerHTML = html;
+    }
+  } catch(e) {
+    document.getElementById('history-detail-body').innerHTML = `<div class="empty" style="color:var(--red)">加载失败: ${e}</div>`;
+  }
+}
+
+async function checkTradingDay() {
+  try {
+    const r = await fetch('/api/trading_day');
+    const d = await r.json();
+    const badge = document.getElementById('trading-badge');
+    if (d.is_trading_day) {
+      badge.textContent = '交易日';
+      badge.className = 'badge active';
+    } else {
+      badge.textContent = '非交易日';
+      badge.className = 'badge inactive';
+    }
+  } catch(e) {}
+}
+
+// 初始化
+checkTradingDay();
+refreshAll();
+loadConfig();
+setInterval(() => {
+  document.getElementById('now-time').textContent = new Date().toLocaleString('zh-CN');
+}, 1000);
+</script>
+</body>
+</html>
