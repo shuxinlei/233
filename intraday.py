@@ -13,6 +13,7 @@ from tabulate import tabulate
 import config
 import data_source
 import indicators
+import history_store
 from models import ScanResult, SectorInfo
 
 RED = '\033[91m'
@@ -54,26 +55,26 @@ def _get_top_sectors():
         df = data_source.get_concept_boards()
         for _, row in df.iterrows() if not df.empty else []:
             sectors.append(SectorInfo(
-                name=row.get('板块名称', ''),
+                name=row.get('板块名称', row.get('板块', '')),
                 change_pct=float(row.get('涨跌幅', 0) or 0),
-                amount=float(row.get('成交额', 0) or 0),
+                amount=float(row.get('成交额', row.get('总成交额', 0)) or 0),
                 rise_count=int(row.get('上涨家数', 0) or 0),
                 fall_count=int(row.get('下跌家数', 0) or 0),
-                leader_stock=row.get('领涨股票', ''),
-                leader_change=float(row.get('领涨股票-涨跌幅', 0) or 0),
+                leader_stock=row.get('领涨股票', row.get('股票名称', '')),
+                leader_change=float(row.get('领涨股票-涨跌幅', row.get('个股-涨跌幅', 0)) or 0),
                 board_type='concept'
             ))
     if config.USE_INDUSTRY_BOARD:
         df = data_source.get_industry_boards()
         for _, row in df.iterrows() if not df.empty else []:
             sectors.append(SectorInfo(
-                name=row.get('板块名称', ''),
+                name=row.get('板块名称', row.get('板块', '')),
                 change_pct=float(row.get('涨跌幅', 0) or 0),
-                amount=float(row.get('成交额', 0) or 0),
+                amount=float(row.get('成交额', row.get('总成交额', 0)) or 0),
                 rise_count=int(row.get('上涨家数', 0) or 0),
                 fall_count=int(row.get('下跌家数', 0) or 0),
-                leader_stock=row.get('领涨股票', ''),
-                leader_change=float(row.get('领涨股票-涨跌幅', 0) or 0),
+                leader_stock=row.get('领涨股票', row.get('股票名称', '')),
+                leader_change=float(row.get('领涨股票-涨跌幅', row.get('个股-涨跌幅', 0)) or 0),
                 board_type='industry'
             ))
     sectors.sort(key=lambda x: x.change_pct, reverse=True)
@@ -255,5 +256,18 @@ def scan(scan_time_label):
 
     print(f"\n  {CYAN}注: 量比* = 代理计算(今日成交额/5日均额按时间折算){RESET}")
     hist_path = data_source.save_scan_history(all_results, scan_time_label)
+    history_store.save_strategy_result(
+        "intraday", f"{datetime.now().strftime('%Y%m%d')}_{scan_time_label.replace(':', '')}",
+        {
+            "scan_time": scan_time_label,
+            "created_at": datetime.now().isoformat(timespec='seconds'),
+            "result_count": len(all_results),
+            "results": [vars(r) for r in all_results],
+            "parameters": {
+                key: getattr(config, key) for key in dir(config)
+                if key.isupper() and isinstance(getattr(config, key), (int, float, str, bool, list))
+            },
+        },
+    )
     print(f"  {GREEN}历史存档: {hist_path}{RESET}")
     return all_results

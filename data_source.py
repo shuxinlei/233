@@ -4,16 +4,47 @@
 """
 import time
 import json
+import os
+import numpy as np
 import akshare as ak
 import pandas as pd
 from datetime import datetime, timedelta
+import history_store
+
+
+class _NumpyJSONEncoder(json.JSONEncoder):
+    """处理numpy类型的JSON编码器"""
+    def default(self, obj):
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.ndarray,)):
+            return obj.tolist()
+        return super().default(obj)
 from typing import Optional
 import config
 
 
-def _retry(func, *args, **kwargs):
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_EASTMONEY_BOARD_AVAILABLE = True
+_SINA_SECTOR_MAP = {}
+
+
+def _cache_sina_sector_map(df: pd.DataFrame, indicator: str):
+    """缓存新浪板块名称到 label 的映射，供成分股接口复用。"""
+    if not df.empty and "板块" in df.columns and "label" in df.columns:
+        _SINA_SECTOR_MAP[indicator] = dict(zip(
+            df["板块"].astype(str), df["label"].astype(str)
+        ))
+
+
+def _retry(func, *args, log_errors=True, attempts=None, **kwargs):
     """带重试的API调用"""
-    for i in range(config.API_RETRY):
+    retry_count = config.API_RETRY if attempts is None else attempts
+    for i in range(retry_count):
         try:
             result = func(*args, **kwargs)
             time.sleep(config.API_DELAY)
@@ -21,21 +52,24 @@ def _retry(func, *args, **kwargs):
                 return pd.DataFrame()
             return result
         except Exception as e:
-            if i < config.API_RETRY - 1:
+            if i < retry_count - 1:
                 time.sleep(config.API_DELAY * (i + 1) * 2)
             else:
-                print(f"  [API错误] {e}")
+                if log_errors:
+                    print(f"  [API错误] {e}")
                 return pd.DataFrame()
     return pd.DataFrame()
 
 
-def get_trading_dates(n: int = 30) -> list:
+def get_trading_dates(n: int = 30, end_date=None) -> list:
     """获取过去n个交易日列表(YYYYMMDD格式)"""
+    if end_date is None:
+        end_date = datetime.now().strftime('%Y%m%d')
+    end_date = pd.Timestamp(str(end_date)).normalize()
     try:
         df = ak.tool_trade_date_hist_sina()
         dates = pd.to_datetime(df['trade_date']).sort_values()
-        today = pd.Timestamp.now().normalize()
-        past = dates[dates <= today].tail(n)
+        past = dates[dates <= end_date].tail(n)
         return [d.strftime('%Y%m%d') for d in past]
     except Exception as e:
         print(f"  [错误] 获取交易日历失败: {e}")
@@ -54,7 +88,13 @@ def get_zt_pool(date: str) -> pd.DataFrame:
     获取指定日期涨停池
     返回列: 代码, 名称, 涨跌幅, 连板数, 成交额, 换手率 等
     """
-    return _retry(ak.stock_zt_pool_em, date=date)
+    key = str(date)
+    cached = history_store.load_dataframe("zt_pool", key)
+    if not cached.empty:
+        return cached
+    df = _retry(ak.stock_zt_pool_em, date=date)
+    history_store.save_dataframe("zt_pool", key, df)
+    return df
 
 
 def _to_sina_symbol(code: str) -> str:
@@ -68,13 +108,18 @@ def _to_sina_symbol(code: str) -> str:
         return 'bj' + code
 
 
-def get_daily_kline(symbol: str, days: int = 20) -> pd.DataFrame:
+def get_daily_kline(symbol: str, days: int = 20, end_date=None) -> pd.DataFrame:
     """
     获取个股日K线(前复权) - 使用新浪数据源
     返回列(统一中文): 日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 换手率
     """
-    end = datetime.now().strftime('%Y%m%d')
-    start = (datetime.now() - timedelta(days=days * 2 + 10)).strftime('%Y%m%d')
+    end = str(end_date or datetime.now().strftime('%Y%m%d'))
+    end_dt = datetime.strptime(end, '%Y%m%d')
+    start = (end_dt - timedelta(days=days * 2 + 10)).strftime('%Y%m%d')
+    cache_key = f"{str(symbol).zfill(6)}:{end}:{days}"
+    cached = history_store.load_dataframe("daily_kline", cache_key)
+    if not cached.empty:
+        return cached
     sina_sym = _to_sina_symbol(symbol)
     df = _retry(
         ak.stock_zh_a_daily,
@@ -92,7 +137,9 @@ def get_daily_kline(symbol: str, days: int = 20) -> pd.DataFrame:
     # 新浪源换手率为小数(0.12=12%)，统一转为百分比
     if '换手率' in df.columns:
         df['换手率'] = df['换手率'] * 100
-    return df.tail(days).reset_index(drop=True)
+    result = df.tail(days).reset_index(drop=True)
+    history_store.save_dataframe("daily_kline", cache_key, result)
+    return result
 
 
 def get_realtime_quotes() -> pd.DataFrame:
@@ -106,17 +153,76 @@ def get_realtime_quotes() -> pd.DataFrame:
         return df
     # 去除交易所前缀 (sz000001 → 000001)
     df['代码'] = df['代码'].astype(str).str[-6:]
+    history_store.save_dataframe(
+        "realtime_quotes", datetime.now().strftime('%Y%m%d_%H%M%S'), df
+    )
     return df
 
 
 def get_industry_boards() -> pd.DataFrame:
     """获取行业板块实时行情"""
-    return _retry(ak.stock_board_industry_name_em)
+    global _EASTMONEY_BOARD_AVAILABLE
+    if _EASTMONEY_BOARD_AVAILABLE:
+        df = _retry(ak.stock_board_industry_name_em, log_errors=False, attempts=1)
+        if not df.empty:
+            return df
+        _EASTMONEY_BOARD_AVAILABLE = False
+        print("  [数据源切换] 东方财富板块接口不可用，本次运行改用新浪板块数据")
+    df = _retry(ak.stock_sector_spot, indicator="行业")
+    _cache_sina_sector_map(df, "行业")
+    history_store.save_dataframe(
+        "industry_boards", datetime.now().strftime('%Y%m%d_%H%M%S'), df
+    )
+    return df
 
 
 def get_concept_boards() -> pd.DataFrame:
     """获取概念板块(题材)实时行情"""
-    return _retry(ak.stock_board_concept_name_em)
+    global _EASTMONEY_BOARD_AVAILABLE
+    if _EASTMONEY_BOARD_AVAILABLE:
+        df = _retry(ak.stock_board_concept_name_em, log_errors=False, attempts=1)
+        if not df.empty:
+            return df
+        _EASTMONEY_BOARD_AVAILABLE = False
+        print("  [数据源切换] 东方财富板块接口不可用，本次运行改用新浪板块数据")
+    df = _retry(ak.stock_sector_spot, indicator="概念")
+    _cache_sina_sector_map(df, "概念")
+    history_store.save_dataframe(
+        "concept_boards", datetime.now().strftime('%Y%m%d_%H%M%S'), df
+    )
+    return df
+
+
+def _get_sina_sector_label(board_name: str, board_type: str) -> str:
+    """将板块名称映射为新浪成分股接口需要的 label。"""
+    indicator = "概念" if board_type == "concept" else "行业"
+    if indicator not in _SINA_SECTOR_MAP:
+        df = _retry(ak.stock_sector_spot, indicator=indicator)
+        if df.empty or "板块" not in df.columns or "label" not in df.columns:
+            _SINA_SECTOR_MAP[indicator] = {}
+        else:
+            _cache_sina_sector_map(df, indicator)
+    if not _SINA_SECTOR_MAP.get(indicator):
+        return ""
+    return _SINA_SECTOR_MAP[indicator].get(str(board_name), "")
+
+
+def _get_sina_constituents(board_name: str, board_type: str) -> pd.DataFrame:
+    """获取新浪板块成分股，并统一成盘中扫描使用的字段。"""
+    label = _get_sina_sector_label(board_name, board_type)
+    if not label:
+        return pd.DataFrame()
+    df = _retry(ak.stock_sector_detail, sector=label)
+    if df.empty:
+        return df
+    result = df.rename(columns={
+        "code": "代码", "name": "名称", "changepercent": "涨跌幅",
+        "turnoverratio": "换手率", "amount": "成交额",
+    })
+    history_store.save_dataframe(
+        "board_constituents", f"{board_type}:{board_name}:{datetime.now().strftime('%Y%m%d_%H%M%S')}", result
+    )
+    return result
 
 
 def get_board_constituents(board_name: str, board_type: str = "concept") -> pd.DataFrame:
@@ -124,15 +230,21 @@ def get_board_constituents(board_name: str, board_type: str = "concept") -> pd.D
     获取板块成分股
     board_type: "concept" 概念板块 / "industry" 行业板块
     """
-    if board_type == "concept":
-        return _retry(ak.stock_board_concept_cons_em, symbol=board_name)
-    else:
-        return _retry(ak.stock_board_industry_cons_em, symbol=board_name)
+    global _EASTMONEY_BOARD_AVAILABLE
+    if _EASTMONEY_BOARD_AVAILABLE:
+        if board_type == "concept":
+            df = _retry(ak.stock_board_concept_cons_em, symbol=board_name, log_errors=False, attempts=1)
+        else:
+            df = _retry(ak.stock_board_industry_cons_em, symbol=board_name, log_errors=False, attempts=1)
+        if not df.empty:
+            return df
+        _EASTMONEY_BOARD_AVAILABLE = False
+    return _get_sina_constituents(board_name, board_type)
 
 
 # ==================== 股池持久化 ====================
 
-POOL_FILE = "stock_pool.json"
+POOL_FILE = os.path.join(BASE_DIR, "stock_pool.json")
 
 
 def save_pool(pool: list, filepath: str = POOL_FILE):
@@ -142,12 +254,11 @@ def save_pool(pool: list, filepath: str = POOL_FILE):
         d = {k: v for k, v in vars(s).items()}
         data.append(d)
     with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, cls=_NumpyJSONEncoder)
 
 
 def load_pool(filepath: str = POOL_FILE) -> list:
     """加载核心股池"""
-    import os
     if not os.path.exists(filepath):
         return []
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -158,7 +269,7 @@ def load_pool(filepath: str = POOL_FILE) -> list:
 
 # ==================== 历史数据存储 ====================
 
-HISTORY_DIR = "history"
+HISTORY_DIR = os.path.join(BASE_DIR, "history")
 
 
 def _ensure_history_dir():
@@ -179,7 +290,7 @@ def save_pool_history(pool: list, date_str: str = None):
         'stocks': [{k: v for k, v in vars(s).items()} for s in pool],
     }
     with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, cls=_NumpyJSONEncoder)
     return filepath
 
 
@@ -197,7 +308,7 @@ def save_scan_history(results: list, scan_time_label: str, date_str: str = None)
         'results': [vars(r) for r in results],
     }
     with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, cls=_NumpyJSONEncoder)
     return filepath
 
 
@@ -238,7 +349,11 @@ def list_history() -> list:
 def load_history(filename: str) -> dict:
     """加载指定历史文件"""
     _ensure_history_dir()
-    filepath = os.path.join(HISTORY_DIR, filename)
+    # 仅允许访问 history 目录下的 JSON 文件，避免路径遍历。
+    safe_name = os.path.basename(filename)
+    if safe_name != filename or not safe_name.endswith('.json'):
+        return {}
+    filepath = os.path.join(HISTORY_DIR, safe_name)
     if not os.path.exists(filepath):
         return {}
     with open(filepath, 'r', encoding='utf-8') as f:

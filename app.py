@@ -6,10 +6,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import os
-import json
 import threading
-import time
-import re
+from contextlib import redirect_stdout
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 
@@ -17,6 +15,8 @@ import config
 import data_source
 
 app = Flask(__name__, template_folder='templates')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TASK_LOCK = threading.Lock()
 
 # 全局状态
 task_status = {
@@ -40,22 +40,21 @@ def _run_pre_market():
         def flush(self):
             pass
 
-    old_stdout = os.dup(1)
-    import sys
-    sys.stdout = LogCapture()
-
     try:
-        from pre_market import build_stock_pool
-        pool = build_stock_pool()
-        task_status['pre_market']['result'] = {
-            'count': len(pool),
-            'stocks': [vars(s) for s in pool],
-            'time': datetime.now().strftime('%H:%M:%S'),
-        }
+        with TASK_LOCK, redirect_stdout(LogCapture()):
+            from pre_market import build_stock_pool
+            pool = build_stock_pool()
+            task_status['pre_market']['result'] = {
+                'count': len(pool),
+                'stocks': [vars(s) for s in pool],
+                'time': datetime.now().strftime('%H:%M:%S'),
+            }
     except Exception as e:
+        import traceback
+        log.append(f'[错误] {e}')
+        log.append(traceback.format_exc().strip())
         task_status['pre_market']['error'] = str(e)
     finally:
-        sys.stdout = sys.__stdout__
         task_status['pre_market']['running'] = False
 
 
@@ -74,21 +73,21 @@ def _run_intraday():
         def flush(self):
             pass
 
-    import sys
-    sys.stdout = LogCapture()
-
     try:
-        from intraday import scan
-        results = scan(datetime.now().strftime('%H:%M'))
-        task_status['intraday']['result'] = {
-            'count': len(results),
-            'results': [vars(r) for r in results],
-            'time': datetime.now().strftime('%H:%M:%S'),
-        }
+        with TASK_LOCK, redirect_stdout(LogCapture()):
+            from intraday import scan
+            results = scan(datetime.now().strftime('%H:%M'))
+            task_status['intraday']['result'] = {
+                'count': len(results),
+                'results': [vars(r) for r in results],
+                'time': datetime.now().strftime('%H:%M:%S'),
+            }
     except Exception as e:
+        import traceback
+        log.append(f'[错误] {e}')
+        log.append(traceback.format_exc().strip())
         task_status['intraday']['error'] = str(e)
     finally:
-        sys.stdout = sys.__stdout__
         task_status['intraday']['running'] = False
 
 
@@ -118,13 +117,13 @@ def get_status():
             'running': task_status['pre_market']['running'],
             'result': task_status['pre_market']['result'],
             'error': task_status['pre_market']['error'],
-            'log_tail': task_status['pre_market']['log'][-20:] if task_status['pre_market']['log'] else [],
+            'log_tail': task_status['pre_market']['log'][-50:] if task_status['pre_market']['log'] else [],
         },
         'intraday': {
             'running': task_status['intraday']['running'],
             'result': task_status['intraday']['result'],
             'error': task_status['intraday']['error'],
-            'log_tail': task_status['intraday']['log'][-20:] if task_status['intraday']['log'] else [],
+            'log_tail': task_status['intraday']['log'][-50:] if task_status['intraday']['log'] else [],
         },
         'now': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     })
@@ -179,7 +178,7 @@ def manage_config():
             updated.append(f'{key}: {val}')
 
     # 持久化到 config_local.py
-    with open('config_local.py', 'w', encoding='utf-8') as f:
+    with open(os.path.join(BASE_DIR, 'config_local.py'), 'w', encoding='utf-8') as f:
         f.write('# 自动生成 - 勿手动编辑\n')
         for attr in dir(config):
             if attr.isupper() and not attr.startswith('_'):
@@ -217,9 +216,10 @@ def get_history_detail(filename):
 
 if __name__ == '__main__':
     # 加载本地配置覆盖
-    if os.path.exists('config_local.py'):
+    config_path = os.path.join(BASE_DIR, 'config_local.py')
+    if os.path.exists(config_path):
         import importlib
-        spec = importlib.util.spec_from_file_location('config_local', 'config_local.py')
+        spec = importlib.util.spec_from_file_location('config_local', config_path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         for attr in dir(mod):

@@ -8,6 +8,7 @@ from tabulate import tabulate
 import config
 import data_source
 import indicators
+import history_store
 from models import StockInfo
 
 RED = '\033[91m'
@@ -23,7 +24,8 @@ def _scan_zt_gene(trading_dates):
     zt_gene = {}
     total = len(trading_dates)
     for i, date in enumerate(trading_dates):
-        print(f"\r  [{i+1}/{total}] 涨停池 {date}...", end='', flush=True)
+        if (i + 1) % 5 == 0 or i == 0:
+            print(f"  [{i+1}/{total}] 涨停池扫描中...")
         df = data_source.get_zt_pool(date)
         if df.empty:
             continue
@@ -68,13 +70,14 @@ def _filter_zt_gene(zt_gene):
     return result
 
 
-def _filter_price_volume(stocks):
+def _filter_price_volume(stocks, end_date=None):
     """量价结构筛选: 红肥绿瘦 + 放量 + 活跃换手"""
     total = len(stocks)
     results = []
     for i, s in enumerate(stocks):
-        print(f"\r  [{i+1}/{total}] K线 {s['code']} {s['name'][:6]}...", end='', flush=True)
-        kline = data_source.get_daily_kline(s['code'], config.KLINE_DAYS)
+        if (i + 1) % 20 == 0 or i == 0:
+            print(f"  [{i+1}/{total}] K线扫描中...")
+        kline = data_source.get_daily_kline(s['code'], config.KLINE_DAYS, end_date=end_date)
         if kline.empty:
             continue
         rg = indicators.calculate_red_green_ratio(kline)
@@ -145,14 +148,19 @@ def _print_report(stocks, zt_count, pv_count):
     print(f"\n{GREEN}核心股池已保存 → stock_pool.json{RESET}\n")
 
 
-def build_stock_pool():
+def build_stock_pool(as_of_date=None):
     """盘前筛选主流程"""
     print(f"\n{BOLD}{'='*60}{RESET}")
     print(f"{BOLD}  盘前筛选启动 {datetime.now().strftime('%H:%M:%S')}{RESET}")
     print(f"{BOLD}{'='*60}{RESET}")
 
     print(f"\n{CYAN}Step 1: 获取交易日历...{RESET}")
-    dates = data_source.get_trading_dates(config.ZT_HISTORY_DAYS)
+    # 盘前只能使用目标日之前已经完成的交易日，禁止把当天行情带入股池。
+    target_date = as_of_date or datetime.now().strftime('%Y%m%d')
+    target_dates = data_source.get_trading_dates(
+        config.ZT_HISTORY_DAYS + 1, end_date=target_date
+    )
+    dates = [d for d in target_dates if d < str(target_date)][-config.ZT_HISTORY_DAYS:]
     if not dates:
         print(f"  {RED}获取交易日历失败{RESET}")
         return []
@@ -171,11 +179,12 @@ def build_stock_pool():
         print(f"  池过大，取Top200进行量价筛选")
 
     print(f"\n{CYAN}Step 3: 量价结构筛选...{RESET}")
-    pv_stocks = _filter_price_volume(zt_stocks)
+    pv_stocks = _filter_price_volume(zt_stocks, end_date=dates[-1] if dates else None)
     print(f"  通过量价筛选: {len(pv_stocks)}只")
 
     print(f"\n{CYAN}Step 4: 辨识度评分...{RESET}")
     scored = _score_stocks(pv_stocks)
+    print(f"  评分完成，Top{len(scored)}只入选核心股池")
 
     pool = [StockInfo(
         code=s['code'], name=s['name'],
@@ -193,6 +202,19 @@ def build_stock_pool():
 
     data_source.save_pool(pool)
     hist_path = data_source.save_pool_history(pool)
+    history_store.save_strategy_result(
+        "pre_market", str(target_date),
+        {
+            "as_of_date": str(target_date),
+            "source_date_end": dates[-1] if dates else "",
+            "pool_size": len(pool),
+            "stocks": [vars(s) for s in pool],
+            "parameters": {
+                key: getattr(config, key) for key in dir(config)
+                if key.isupper() and isinstance(getattr(config, key), (int, float, str, bool, list))
+            },
+        },
+    )
     _print_report(scored, len(zt_stocks), len(pv_stocks))
     print(f"  {GREEN}历史存档: {hist_path}{RESET}")
     return pool

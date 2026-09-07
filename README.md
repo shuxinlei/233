@@ -28,6 +28,7 @@ trading_233/
 ├── pre_market.py       # 盘前筛选模块（涨停基因 + 量价 + 评分）
 ├── intraday.py         # 盘中扫描模块（4时间节点，三重确认）
 ├── data_source.py      # AkShare 数据源封装 + 历史数据存储
+├── history_store.py    # SQLite 行情快照与策略结果存储（回测基础）
 ├── indicators.py       # 技术指标（红绿比、量比、MA5等）
 ├── models.py           # 数据模型（StockInfo / SectorInfo / ScanResult）
 ├── config.py           # 策略参数集中配置
@@ -130,14 +131,25 @@ python app.py
 
 ## 历史数据
 
-每次盘前筛选和盘中扫描完成后，自动存档到 `history/` 目录：
+每次盘前筛选和盘中扫描完成后，自动存档到 `history/` 目录；接口原始数据和规则参数同时写入 `history/market_data.db`：
 
 | 文件 | 内容 |
 |------|------|
 | `YYYYMMDD_pool.json` | 当日核心股池（含代码、名称、板块、评分等） |
 | `YYYYMMDD_scan_HHMM.json` | 盘中扫描结果（含四条件共振状态） |
+| `market_data.db` | 涨停池、日K、实时行情、板块、板块成分股及策略运行参数快照 |
 
 通过 Web 页面「历史记录」Tab 可查看所有存档，左侧列表选择，右侧展示完整数据表格。
+
+盘前筛选支持 `build_stock_pool(as_of_date='YYYYMMDD')`，只使用目标日前已完成交易日的数据，避免回测时把当天收盘结果带入盘前决策。后续回测应直接读取 `market_data.db` 的快照，固定当时参数运行规则，并将收益、最大回撤、胜率等评估结果另行保存。
+
+## 后续优化顺序
+
+1. 按板块建立盘前核心股池，补齐板块内核心排名。
+2. 增加板块强度和持续性判断，记录四个时间点的资金切换。
+3. 增加龙头相对强度、板块带动能力和第二/第三核心逻辑。
+4. 区分半路、低吸和错过后的跟随机会。
+5. 开发基于历史快照的回测模块，用固定样本验证每次规则调整。
 
 ## 数据源
 
@@ -148,8 +160,8 @@ python app.py
 | 涨停池 | `stock_zt_pool_em` | 东方财富，含所属板块 |
 | 日K线 | `stock_zh_a_daily` | 新浪财经，前复权 |
 | 实时行情 | `stock_zh_a_spot` | 新浪财经，全市场快照 |
-| 概念板块 | `stock_board_concept_name_em` | 东方财富 |
-| 行业板块 | `stock_board_industry_name_em` | 东方财富 |
+| 概念板块 | `stock_board_concept_name_em` / `stock_sector_spot` | 东方财富失败时自动切换新浪 |
+| 行业板块 | `stock_board_industry_name_em` / `stock_sector_spot` | 东方财富失败时自动切换新浪 |
 
 ## 技术栈
 
