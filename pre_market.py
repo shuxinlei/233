@@ -1,8 +1,11 @@
 """
 233战法 - 盘前筛选模块
 流程: 涨停基因 → 量价结构 → 辨识度评分 → 核心股池
+
+模块分层:
+  compute_pool()      纯计算，只读数据不落盘 —— 回测按日重建股池走这里
+  build_stock_pool()  compute_pool + 落盘 + 历史存档 —— 实盘/Web 走这里
 """
-import time
 from datetime import datetime
 from tabulate import tabulate
 import config
@@ -19,13 +22,18 @@ BOLD = '\033[1m'
 RESET = '\033[0m'
 
 
-def _scan_zt_gene(trading_dates):
+def _log(msg='', verbose=True):
+    if verbose:
+        print(msg)
+
+
+def _scan_zt_gene(trading_dates, verbose=True):
     """扫描涨停基因: 统计回看期内每只股票的涨停数据"""
     zt_gene = {}
     total = len(trading_dates)
     for i, date in enumerate(trading_dates):
         if (i + 1) % 5 == 0 or i == 0:
-            print(f"  [{i+1}/{total}] 涨停池扫描中...")
+            _log(f"  [{i+1}/{total}] 涨停池扫描中...", verbose)
         df = data_source.get_zt_pool(date)
         if df.empty:
             continue
@@ -49,7 +57,7 @@ def _scan_zt_gene(trading_dates):
             zt_gene[code]['amounts'].append(amount)
             if not zt_gene[code].get('sector'):
                 zt_gene[code]['sector'] = str(row.get('所属板块', '') or '')
-    print()
+    _log('', verbose)
     return zt_gene
 
 
@@ -70,13 +78,13 @@ def _filter_zt_gene(zt_gene):
     return result
 
 
-def _filter_price_volume(stocks, end_date=None):
+def _filter_price_volume(stocks, end_date=None, verbose=True):
     """量价结构筛选: 红肥绿瘦 + 放量 + 活跃换手"""
     total = len(stocks)
     results = []
     for i, s in enumerate(stocks):
         if (i + 1) % 20 == 0 or i == 0:
-            print(f"  [{i+1}/{total}] K线扫描中...")
+            _log(f"  [{i+1}/{total}] K线扫描中...", verbose)
         kline = data_source.get_daily_kline(s['code'], config.KLINE_DAYS, end_date=end_date)
         if kline.empty:
             continue
@@ -91,7 +99,7 @@ def _filter_price_volume(stocks, end_date=None):
             s['amount'] = amt
             s['avg_amount_5d'] = float(kline['成交额'].tail(5).mean())
             results.append(s)
-    print()
+    _log('', verbose)
     return results
 
 
@@ -148,45 +156,76 @@ def _print_report(stocks, zt_count, pv_count):
     print(f"\n{GREEN}核心股池已保存 → stock_pool.json{RESET}\n")
 
 
-def build_stock_pool(as_of_date=None):
-    """盘前筛选主流程"""
-    print(f"\n{BOLD}{'='*60}{RESET}")
-    print(f"{BOLD}  盘前筛选启动 {datetime.now().strftime('%H:%M:%S')}{RESET}")
-    print(f"{BOLD}{'='*60}{RESET}")
+# ==================== 纯计算 ====================
 
-    print(f"\n{CYAN}Step 1: 获取交易日历...{RESET}")
-    # 盘前只能使用目标日之前已经完成的交易日，禁止把当天行情带入股池。
-    target_date = as_of_date or datetime.now().strftime('%Y%m%d')
+def resolve_source_dates(as_of_date=None):
+    """
+    解析盘前可用的数据日期。
+
+    盘前只能使用目标日之前已经完成的交易日，禁止把当天行情带入股池，
+    否则回测会用到当天收盘结果(未来函数)。
+    返回 (target_date, dates)
+    """
+    target_date = str(as_of_date or datetime.now().strftime('%Y%m%d'))
     target_dates = data_source.get_trading_dates(
         config.ZT_HISTORY_DAYS + 1, end_date=target_date
     )
-    dates = [d for d in target_dates if d < str(target_date)][-config.ZT_HISTORY_DAYS:]
+    dates = [d for d in target_dates if d < target_date][-config.ZT_HISTORY_DAYS:]
+    return target_date, dates
+
+
+def candidate_codes(as_of_date=None):
+    """
+    只做涨停基因筛选，返回进入量价筛选的候选代码。
+    回测用它预先算出全区间需要的股票，一次性批量预取日K。
+    """
+    _, dates = resolve_source_dates(as_of_date)
     if not dates:
-        print(f"  {RED}获取交易日历失败{RESET}")
         return []
-    print(f"  {len(dates)}个交易日: {dates[0]} ~ {dates[-1]}")
+    zt_stocks = _filter_zt_gene(_scan_zt_gene(dates, verbose=False))
+    return [s['code'] for s in zt_stocks[:config.PV_SCAN_MAX]]
 
-    print(f"\n{CYAN}Step 2: 涨停基因扫描...{RESET}")
-    zt_gene = _scan_zt_gene(dates)
-    zt_stocks = _filter_zt_gene(zt_gene)
-    print(f"  涨停基因池: {len(zt_stocks)}只")
+
+def compute_pool(as_of_date=None, verbose=True):
+    """
+    盘前筛选纯计算: 涨停基因 → 量价结构 → 辨识度评分。
+    只读数据，不写 stock_pool.json、不写历史存档。
+    返回 (scored_stocks, stats)
+    """
+    target_date, dates = resolve_source_dates(as_of_date)
+    if not dates:
+        _log(f"  {RED}获取交易日历失败{RESET}", verbose)
+        return [], {'target_date': target_date, 'source_date_end': '',
+                    'zt_gene_count': 0, 'pv_pass_count': 0}
+    _log(f"  {len(dates)}个交易日: {dates[0]} ~ {dates[-1]}", verbose)
+
+    _log(f"\n{CYAN}Step 2: 涨停基因扫描...{RESET}", verbose)
+    zt_stocks = _filter_zt_gene(_scan_zt_gene(dates, verbose))
+    _log(f"  涨停基因池: {len(zt_stocks)}只", verbose)
+    stats = {'target_date': target_date, 'source_date_end': dates[-1],
+             'zt_gene_count': len(zt_stocks), 'pv_pass_count': 0}
     if not zt_stocks:
-        print(f"  {YELLOW}无涨停基因股票{RESET}")
-        return []
+        _log(f"  {YELLOW}无涨停基因股票{RESET}", verbose)
+        return [], stats
 
-    if len(zt_stocks) > 200:
-        zt_stocks = zt_stocks[:200]
-        print(f"  池过大，取Top200进行量价筛选")
+    if len(zt_stocks) > config.PV_SCAN_MAX:
+        zt_stocks = zt_stocks[:config.PV_SCAN_MAX]
+        _log(f"  池过大，取Top{config.PV_SCAN_MAX}进行量价筛选", verbose)
 
-    print(f"\n{CYAN}Step 3: 量价结构筛选...{RESET}")
-    pv_stocks = _filter_price_volume(zt_stocks, end_date=dates[-1] if dates else None)
-    print(f"  通过量价筛选: {len(pv_stocks)}只")
+    _log(f"\n{CYAN}Step 3: 量价结构筛选...{RESET}", verbose)
+    pv_stocks = _filter_price_volume(zt_stocks, end_date=dates[-1], verbose=verbose)
+    _log(f"  通过量价筛选: {len(pv_stocks)}只", verbose)
+    stats['pv_pass_count'] = len(pv_stocks)
 
-    print(f"\n{CYAN}Step 4: 辨识度评分...{RESET}")
+    _log(f"\n{CYAN}Step 4: 辨识度评分...{RESET}", verbose)
     scored = _score_stocks(pv_stocks)
-    print(f"  评分完成，Top{len(scored)}只入选核心股池")
+    _log(f"  评分完成，Top{len(scored)}只入选核心股池", verbose)
+    return scored, stats
 
-    pool = [StockInfo(
+
+def to_stock_info(s) -> StockInfo:
+    """筛选结果 dict → StockInfo"""
+    return StockInfo(
         code=s['code'], name=s['name'],
         zt_count=s['zt_count'],
         max_consecutive=s.get('max_consecutive', 0),
@@ -198,23 +237,34 @@ def build_stock_pool(as_of_date=None):
         avg_amount_5d=s.get('avg_amount_5d', 0),
         score=s['score'],
         sector=s.get('sector', '')
-    ) for s in scored]
+    )
+
+
+# ==================== 实盘入口(计算 + 落盘) ====================
+
+def build_stock_pool(as_of_date=None):
+    """盘前筛选主流程: 计算 + 保存股池 + 历史存档"""
+    print(f"\n{BOLD}{'='*60}{RESET}")
+    print(f"{BOLD}  盘前筛选启动 {datetime.now().strftime('%H:%M:%S')}{RESET}")
+    print(f"{BOLD}{'='*60}{RESET}")
+
+    print(f"\n{CYAN}Step 1: 获取交易日历...{RESET}")
+    scored, stats = compute_pool(as_of_date=as_of_date, verbose=True)
+    # 空池也照样落盘: 否则盘中扫描会读到上一交易日的旧股池，比读到空池更危险
+    pool = [to_stock_info(s) for s in scored]
 
     data_source.save_pool(pool)
     hist_path = data_source.save_pool_history(pool)
     history_store.save_strategy_result(
-        "pre_market", str(target_date),
+        "pre_market", stats['target_date'],
         {
-            "as_of_date": str(target_date),
-            "source_date_end": dates[-1] if dates else "",
+            "as_of_date": stats['target_date'],
+            "source_date_end": stats['source_date_end'],
             "pool_size": len(pool),
             "stocks": [vars(s) for s in pool],
-            "parameters": {
-                key: getattr(config, key) for key in dir(config)
-                if key.isupper() and isinstance(getattr(config, key), (int, float, str, bool, list))
-            },
+            "parameters": config.snapshot(),
         },
     )
-    _print_report(scored, len(zt_stocks), len(pv_stocks))
+    _print_report(scored, stats['zt_gene_count'], stats['pv_pass_count'])
     print(f"  {GREEN}历史存档: {hist_path}{RESET}")
     return pool

@@ -244,6 +244,9 @@ tr:hover td { background: rgba(88,166,255,0.05); }
     <div class="tab" data-tab="history" onclick="switchTab('history'); loadHistory()">
       历史记录
     </div>
+    <div class="tab" data-tab="backtest" onclick="switchTab('backtest'); loadBacktests()">
+      回测
+    </div>
   </div>
 
   <!-- 核心股池 -->
@@ -320,6 +323,59 @@ tr:hover td { background: rgba(88,166,255,0.05); }
     </div>
   </div>
 
+  <!-- 回测 -->
+  <div id="tab-backtest" class="tab-content hidden">
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-header">
+        <h3>盘前股池回测</h3>
+        <span class="meta">按日重建股池(只用当日之前数据) → 开盘买入 → 按出场方式卖出</span>
+      </div>
+      <div style="padding:16px;display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">
+        <label style="font-size:12px;color:var(--text-dim)">起始日<br>
+          <input id="bt-start" placeholder="20260601" style="margin-top:4px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:4px;width:110px;font-family:inherit"></label>
+        <label style="font-size:12px;color:var(--text-dim)">结束日<br>
+          <input id="bt-end" placeholder="20260904" style="margin-top:4px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:4px;width:110px;font-family:inherit"></label>
+        <label style="font-size:12px;color:var(--text-dim)">出场方式<br>
+          <select id="bt-exit" style="margin-top:4px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:4px;font-family:inherit">
+            <option value="next_open">次日开盘卖 (T+1)</option>
+            <option value="next_close">次日收盘卖</option>
+            <option value="nday_close">第N日收盘卖</option>
+            <option value="same_close">当日收盘卖 (T+0，仅参考)</option>
+          </select></label>
+        <label style="font-size:12px;color:var(--text-dim)">持有天数<br>
+          <input id="bt-hold" placeholder="1" style="margin-top:4px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:4px;width:70px;font-family:inherit"></label>
+        <label style="font-size:12px;color:var(--text-dim)">每日取前N只<br>
+          <input id="bt-topn" placeholder="0=全池" style="margin-top:4px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:4px;width:90px;font-family:inherit"></label>
+        <button class="btn primary" id="btn-backtest" onclick="runBacktest()">开始回测</button>
+        <span class="meta" id="bt-hint" style="color:var(--yellow)"></span>
+      </div>
+    </div>
+
+    <div id="bt-result-card" class="card hidden" style="margin-bottom:12px">
+      <div class="card-header">
+        <h3 id="bt-result-title">回测结果</h3>
+        <span class="meta" id="bt-result-meta"></span>
+      </div>
+      <div id="bt-result-body" style="padding:16px"></div>
+    </div>
+
+    <div style="display:flex;gap:12px">
+      <div class="card" style="width:320px;flex-shrink:0">
+        <div class="card-header"><h3>回测存档</h3><span class="meta" id="bt-count"></span></div>
+        <div id="bt-list" style="max-height:520px;overflow-y:auto">
+          <div class="empty">暂无回测存档</div>
+        </div>
+      </div>
+      <div class="card" style="flex:1;min-width:0">
+        <div class="card-header">
+          <h3 id="bt-detail-title">选择左侧存档查看逐笔交易</h3>
+          <span class="meta" id="bt-detail-meta"></span>
+        </div>
+        <div id="bt-detail-body"><div class="empty">点击左侧任意一条回测存档</div></div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -380,15 +436,22 @@ async function updateStatus() {
     // 按钮状态
     const preRunning = d.pre_market.running;
     const intraRunning = d.intraday.running;
+    const btRunning = d.backtest.running;
     const btnPre = document.getElementById('btn-pre');
     const btnIntra = document.getElementById('btn-intraday');
     btnPre.disabled = preRunning;
     btnPre.innerHTML = preRunning ? '<span class="spinner"></span>运行中' : '盘前筛选';
     btnIntra.disabled = intraRunning;
     btnIntra.innerHTML = intraRunning ? '<span class="spinner"></span>运行中' : '盘中扫描';
+    const btnBt = document.getElementById('btn-backtest');
+    if (btnBt) {
+      btnBt.disabled = btRunning;
+      btnBt.innerHTML = btRunning ? '<span class="spinner"></span>回测中' : '开始回测';
+    }
 
     // 日志
-    const logData = currentLog === 'pre' ? d.pre_market : d.intraday;
+    const logData = currentLog === 'pre' ? d.pre_market
+                  : (currentLog === 'backtest' ? d.backtest : d.intraday);
     const logBox = document.getElementById('log-body');
     if (logData.log_tail && logData.log_tail.length > 0) {
       logBox.innerHTML = logData.log_tail.map(l => {
@@ -418,8 +481,17 @@ async function updateStatus() {
       body.innerHTML = `<div class="empty" style="color:var(--red)">错误: ${d.intraday.error}</div>`;
     }
 
+    // 回测结果
+    if (d.backtest.result) {
+      renderBacktestResult(d.backtest.result);
+      if (!btRunning) { document.getElementById('bt-hint').textContent = ''; loadBacktests(); }
+    }
+    if (d.backtest.error) {
+      document.getElementById('bt-hint').textContent = '回测失败: ' + d.backtest.error;
+    }
+
     // 停止轮询
-    if (!preRunning && !intraRunning) {
+    if (!preRunning && !intraRunning && !btRunning) {
       clearInterval(statusTimer);
       statusTimer = null;
     }
@@ -646,6 +718,174 @@ async function loadHistoryDetail(filename) {
     }
   } catch(e) {
     document.getElementById('history-detail-body').innerHTML = `<div class="empty" style="color:var(--red)">加载失败: ${e}</div>`;
+  }
+}
+
+// ==================== 回测 ====================
+
+function pctCls(v) {
+  if (v === null || v === undefined) return '';
+  return v > 0 ? 'color:var(--green)' : (v < 0 ? 'color:var(--red)' : '');
+}
+function pct(v, d) {
+  if (v === null || v === undefined) return '-';
+  return (v > 0 ? '+' : '') + Number(v).toFixed(d === undefined ? 2 : d) + '%';
+}
+
+async function runBacktest() {
+  const body = {
+    start: document.getElementById('bt-start').value.trim(),
+    end: document.getElementById('bt-end').value.trim(),
+    exit_mode: document.getElementById('bt-exit').value,
+    hold_days: document.getElementById('bt-hold').value.trim(),
+    top_n: document.getElementById('bt-topn').value.trim(),
+  };
+  const hint = document.getElementById('bt-hint');
+  if (!body.start || !body.end) { hint.textContent = '请填写起始日和结束日 (YYYYMMDD)'; return; }
+  hint.textContent = '回测需要按日重建股池并预取日K，首次跑可能要几分钟…';
+  try {
+    const r = await fetch('/api/run/backtest', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (!d.ok) { hint.textContent = d.msg || '启动失败'; return; }
+    currentLog = 'backtest';
+    startStatusPoll();
+  } catch(e) { hint.textContent = '启动失败: ' + e; }
+}
+
+function renderBacktestResult(res) {
+  const card = document.getElementById('bt-result-card');
+  card.classList.remove('hidden');
+  const bodyEl = document.getElementById('bt-result-body');
+
+  if (!res.ok) {
+    document.getElementById('bt-result-title').textContent = '回测结果';
+    document.getElementById('bt-result-meta').textContent = '';
+    bodyEl.innerHTML = `<div class="empty" style="color:var(--yellow)">${res.msg || '无结果'}</div>`;
+    return;
+  }
+  const s = res.summary || {}, m = res.metrics || {};
+  document.getElementById('bt-result-title').textContent = `${s.start} ~ ${s.end} · ${s.exit_mode}`;
+  document.getElementById('bt-result-meta').textContent =
+    `${res.time || ''} · 成本${s.cost_pct}% · ${s.top_n ? '前'+s.top_n+'只' : '全池'}`;
+
+  if (!m.trade_count) {
+    bodyEl.innerHTML = '<div class="empty" style="color:var(--yellow)">区间内未产生任何交易</div>';
+    return;
+  }
+
+  const tiles = [
+    ['胜率', pct(m.win_rate_pct), ''],
+    ['平均收益', pct(m.avg_return_pct, 3), pctCls(m.avg_return_pct)],
+    ['累计收益', pct(m.total_return_pct), pctCls(m.total_return_pct)],
+    ['最大回撤', pct(m.max_drawdown_pct), 'color:var(--red)'],
+    ['夏普', m.sharpe === null || m.sharpe === undefined ? '-' : m.sharpe, pctCls(m.sharpe)],
+    ['盈亏比', m.profit_factor === null || m.profit_factor === undefined ? '-' : m.profit_factor, ''],
+    ['交易笔数', m.trade_count, ''],
+    ['日均笔数', m.avg_trades_per_day, ''],
+  ];
+  let html = '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px">';
+  tiles.forEach(([k, v, cls]) => {
+    html += `<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 14px;min-width:104px">
+      <div style="font-size:11px;color:var(--text-dim)">${k}</div>
+      <div style="font-size:17px;font-weight:700;margin-top:2px;${cls}">${v}</div></div>`;
+  });
+  html += '</div>';
+
+  const bm = res.benchmark;
+  if (bm) {
+    const excess = m.total_return_pct - bm.total_return_pct;
+    html += `<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">
+      基准 ${bm.symbol} 同期 <span style="${pctCls(bm.total_return_pct)}">${pct(bm.total_return_pct)}</span>
+      (回撤 ${pct(bm.max_drawdown_pct)}) ·
+      超额 <span style="${pctCls(excess)}">${pct(excess)}</span></div>`;
+  }
+
+  if (res.rank_buckets && res.rank_buckets.length) {
+    html += `<div style="font-size:12px;color:var(--text-dim);margin-bottom:6px">评分区分度 — 按标的在当日股池中的排名分组，靠前分位收益应明显更高</div>
+      <table style="margin-bottom:14px"><thead><tr><th>排名分位</th><th>笔数</th><th>胜率</th><th>平均收益</th></tr></thead><tbody>`;
+    res.rank_buckets.forEach(b => {
+      html += `<tr><td>${b.bucket}</td><td>${b.count}</td>
+        <td>${b.win_rate_pct === null ? '-' : pct(b.win_rate_pct)}</td>
+        <td style="${pctCls(b.avg_return_pct)}">${b.avg_return_pct === null ? '-' : pct(b.avg_return_pct, 3)}</td></tr>`;
+    });
+    html += '</tbody></table>';
+  }
+
+  const skip = res.skipped || {};
+  const skipKeys = Object.keys(skip);
+  if (skipKeys.length) {
+    html += `<div style="font-size:12px;color:var(--text-dim)">跳过的信号: ` +
+      skipKeys.map(k => `${k} ${skip[k]}笔`).join(' · ') + '</div>';
+  }
+  bodyEl.innerHTML = html;
+}
+
+async function loadBacktests() {
+  try {
+    const r = await fetch('/api/backtest');
+    const d = await r.json();
+    const listEl = document.getElementById('bt-list');
+    document.getElementById('bt-count').textContent = (d.length || 0) + '条';
+    if (!d || d.length === 0) {
+      listEl.innerHTML = '<div class="empty">暂无回测存档<br><span style="font-size:12px;color:var(--text-dim)">跑一次回测后自动存档</span></div>';
+      return;
+    }
+    listEl.innerHTML = d.map(item => {
+      const s = item.summary || {}, m = item.metrics || {};
+      const tot = m.total_return_pct;
+      return `<div style="padding:8px 12px;border-bottom:1px solid var(--border);cursor:pointer"
+        onclick="loadBacktestDetail('${item.filename}')"
+        onmouseover="this.style.background='rgba(88,166,255,0.08)'"
+        onmouseout="this.style.background=''">
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="font-weight:600">${s.start || '?'} ~ ${s.end || '?'}</span>
+          <span style="font-size:11px;color:var(--text-dim)">${s.exit_mode || ''}</span>
+        </div>
+        <div style="font-size:12px;margin-top:2px;color:var(--text-dim)">
+          ${m.trade_count || 0}笔 · 胜率${m.win_rate_pct === undefined ? '-' : m.win_rate_pct + '%'} ·
+          <span style="${pctCls(tot)}">${tot === undefined ? '-' : pct(tot)}</span>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('bt-list').innerHTML = `<div class="empty" style="color:var(--red)">加载失败: ${e}</div>`;
+  }
+}
+
+async function loadBacktestDetail(filename) {
+  const bodyEl = document.getElementById('bt-detail-body');
+  bodyEl.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const r = await fetch('/api/backtest/' + filename);
+    const d = await r.json();
+    const s = d.summary || {}, m = d.metrics || {};
+    document.getElementById('bt-detail-title').textContent = `${s.start || ''} ~ ${s.end || ''} · ${s.exit_mode || ''}`;
+    document.getElementById('bt-detail-meta').textContent =
+      `${(d.trades || []).length}笔 · 累计${m.total_return_pct === undefined ? '-' : pct(m.total_return_pct)}`;
+
+    const trades = (d.trades || []).slice().sort((a, b) =>
+      a.entry_date === b.entry_date ? a.rank - b.rank : (a.entry_date < b.entry_date ? 1 : -1));
+    if (!trades.length) { bodyEl.innerHTML = '<div class="empty">该存档无交易</div>'; return; }
+
+    let html = `<div style="max-height:520px;overflow-y:auto"><table><thead><tr>
+      <th>入场日</th><th>排名</th><th>代码</th><th>名称</th><th>板块</th>
+      <th>买入</th><th>卖出</th><th>出场日</th><th>净收益</th><th>评分</th>
+    </tr></thead><tbody>`;
+    trades.forEach(t => {
+      html += `<tr>
+        <td>${t.entry_date}</td><td>${t.rank}</td><td>${t.code}</td>
+        <td>${(t.name || '').slice(0,6)}</td>
+        <td style="color:var(--text-dim);font-size:12px">${(t.sector || '').slice(0,10) || '-'}</td>
+        <td>${t.entry_price}</td><td>${t.exit_price}</td><td>${t.exit_date}</td>
+        <td style="${pctCls(t.net_pct)};font-weight:600">${pct(t.net_pct, 2)}</td>
+        <td>${t.score}</td></tr>`;
+    });
+    html += '</tbody></table></div>';
+    bodyEl.innerHTML = html;
+  } catch(e) {
+    bodyEl.innerHTML = `<div class="empty" style="color:var(--red)">加载失败: ${e}</div>`;
   }
 }
 

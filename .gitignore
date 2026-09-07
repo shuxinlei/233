@@ -8,3 +8,4 @@ history/
 .DS_Store
 .venv/
 venv/
+.claude/

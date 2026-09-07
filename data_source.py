@@ -32,6 +32,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _EASTMONEY_BOARD_AVAILABLE = True
 _SINA_SECTOR_MAP = {}
 
+# 进程内缓存。回测会对同一批日期/代码反复取数，仅靠 SQLite 仍有大量重复反序列化。
+_ZT_POOL_MEM = {}
+# 回测批量预取的整段日K: code -> DataFrame(日期已转 Timestamp)
+_BULK_KLINE = {}
+# 预取覆盖的区间 (start, end)。只有请求日期落在区间内才用预取数据，
+# 否则回落到正常取数路径 —— 避免回测残留的缓存把过期切片喂给之后的实盘筛选。
+_BULK_RANGE = None
+# 交易日历(整个进程只取一次): 回测按日重建股池会反复查日历
+_TRADE_CAL = None
+
 
 def _cache_sina_sector_map(df: pd.DataFrame, indicator: str):
     """缓存新浪板块名称到 label 的映射，供成分股接口复用。"""
@@ -61,19 +71,43 @@ def _retry(func, *args, log_errors=True, attempts=None, **kwargs):
     return pd.DataFrame()
 
 
+def _trade_calendar() -> pd.DatetimeIndex:
+    """交易日历，进程内缓存 + 快照按天失效。"""
+    global _TRADE_CAL
+    if _TRADE_CAL is not None:
+        return _TRADE_CAL
+    cache_key = datetime.now().strftime('%Y%m%d')
+    df = history_store.load_dataframe("trade_calendar", cache_key)
+    if df.empty:
+        try:
+            df = ak.tool_trade_date_hist_sina()
+        except Exception as e:
+            print(f"  [错误] 获取交易日历失败: {e}")
+            return pd.DatetimeIndex([])
+        history_store.save_dataframe("trade_calendar", cache_key, df)
+    _TRADE_CAL = pd.DatetimeIndex(pd.to_datetime(df['trade_date'])).sort_values()
+    return _TRADE_CAL
+
+
 def get_trading_dates(n: int = 30, end_date=None) -> list:
-    """获取过去n个交易日列表(YYYYMMDD格式)"""
+    """获取截止 end_date(含)的最近n个交易日列表(YYYYMMDD格式)"""
     if end_date is None:
         end_date = datetime.now().strftime('%Y%m%d')
-    end_date = pd.Timestamp(str(end_date)).normalize()
-    try:
-        df = ak.tool_trade_date_hist_sina()
-        dates = pd.to_datetime(df['trade_date']).sort_values()
-        past = dates[dates <= end_date].tail(n)
-        return [d.strftime('%Y%m%d') for d in past]
-    except Exception as e:
-        print(f"  [错误] 获取交易日历失败: {e}")
+    end = pd.Timestamp(str(end_date)).normalize()
+    cal = _trade_calendar()
+    if len(cal) == 0:
         return []
+    return [d.strftime('%Y%m%d') for d in cal[cal <= end][-n:]]
+
+
+def get_trading_dates_between(start, end) -> list:
+    """获取 [start, end] 闭区间内的交易日列表(YYYYMMDD格式)"""
+    cal = _trade_calendar()
+    if len(cal) == 0:
+        return []
+    lo = pd.Timestamp(str(start)).normalize()
+    hi = pd.Timestamp(str(end)).normalize()
+    return [d.strftime('%Y%m%d') for d in cal[(cal >= lo) & (cal <= hi)]]
 
 
 def is_trading_day() -> bool:
@@ -89,11 +123,15 @@ def get_zt_pool(date: str) -> pd.DataFrame:
     返回列: 代码, 名称, 涨跌幅, 连板数, 成交额, 换手率 等
     """
     key = str(date)
+    if key in _ZT_POOL_MEM:
+        return _ZT_POOL_MEM[key]
     cached = history_store.load_dataframe("zt_pool", key)
     if not cached.empty:
+        _ZT_POOL_MEM[key] = cached
         return cached
     df = _retry(ak.stock_zt_pool_em, date=date)
     history_store.save_dataframe("zt_pool", key, df)
+    _ZT_POOL_MEM[key] = df
     return df
 
 
@@ -108,38 +146,144 @@ def _to_sina_symbol(code: str) -> str:
         return 'bj' + code
 
 
+# 新浪源英文列名 → 统一中文
+_KLINE_COL_MAP = {
+    'date': '日期', 'open': '开盘', 'close': '收盘',
+    'high': '最高', 'low': '最低', 'volume': '成交量',
+    'amount': '成交额', 'turnover': '换手率'
+}
+
+
+def _normalize_kline(df: pd.DataFrame) -> pd.DataFrame:
+    """统一列名，并把新浪的小数换手率(0.12=12%)转成百分比。"""
+    if df.empty:
+        return df
+    df = df.rename(columns={k: v for k, v in _KLINE_COL_MAP.items() if k in df.columns})
+    if '换手率' in df.columns:
+        df['换手率'] = df['换手率'] * 100
+    return df
+
+
 def get_daily_kline(symbol: str, days: int = 20, end_date=None) -> pd.DataFrame:
     """
     获取个股日K线(前复权) - 使用新浪数据源
     返回列(统一中文): 日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 换手率
+
+    若该代码已被 prefetch_klines 预取，直接从内存整段切片，不再请求接口。
     """
+    code = str(symbol).zfill(6)
+    if code in _BULK_KLINE and _bulk_covers(end_date):
+        return slice_bulk_kline(code, days, end_date)
+
     end = str(end_date or datetime.now().strftime('%Y%m%d'))
     end_dt = datetime.strptime(end, '%Y%m%d')
     start = (end_dt - timedelta(days=days * 2 + 10)).strftime('%Y%m%d')
-    cache_key = f"{str(symbol).zfill(6)}:{end}:{days}"
+    cache_key = f"{code}:{end}:{days}"
     cached = history_store.load_dataframe("daily_kline", cache_key)
     if not cached.empty:
         return cached
-    sina_sym = _to_sina_symbol(symbol)
     df = _retry(
         ak.stock_zh_a_daily,
-        symbol=sina_sym, start_date=start, end_date=end, adjust="qfq"
+        symbol=_to_sina_symbol(code), start_date=start, end_date=end, adjust="qfq"
     )
     if df.empty:
         return df
-    # 新浪源英文列名 → 统一中文
-    col_map = {
-        'date': '日期', 'open': '开盘', 'close': '收盘',
-        'high': '最高', 'low': '最低', 'volume': '成交量',
-        'amount': '成交额', 'turnover': '换手率'
-    }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-    # 新浪源换手率为小数(0.12=12%)，统一转为百分比
-    if '换手率' in df.columns:
-        df['换手率'] = df['换手率'] * 100
-    result = df.tail(days).reset_index(drop=True)
+    result = _normalize_kline(df).tail(days).reset_index(drop=True)
     history_store.save_dataframe("daily_kline", cache_key, result)
     return result
+
+
+# ==================== 回测: 整段日K预取 ====================
+
+def _fetch_kline_range(code: str, start: str, end: str) -> pd.DataFrame:
+    """取单只股票 [start, end] 整段日K，快照缓存按代码+区间存。"""
+    cache_key = f"{code}:{start}:{end}"
+    df = history_store.load_dataframe("kline_range", cache_key)
+    if df.empty:
+        raw = _retry(
+            ak.stock_zh_a_daily,
+            symbol=_to_sina_symbol(code), start_date=start, end_date=end, adjust="qfq"
+        )
+        df = _normalize_kline(raw)
+        if df.empty:
+            return df
+        history_store.save_dataframe("kline_range", cache_key, df)
+    if '日期' in df.columns:
+        df = df.copy()
+        df['日期'] = pd.to_datetime(df['日期'])
+        df = df.sort_values('日期').reset_index(drop=True)
+    return df
+
+
+def _bulk_covers(end_date) -> bool:
+    """请求的截止日期是否落在预取区间内。"""
+    if _BULK_RANGE is None:
+        return False
+    end = pd.Timestamp(str(end_date or datetime.now().strftime('%Y%m%d')))
+    return pd.Timestamp(_BULK_RANGE[0]) <= end <= pd.Timestamp(_BULK_RANGE[1])
+
+
+def prefetch_klines(codes, start: str, end: str, progress_every: int = 50) -> int:
+    """
+    批量预取整段日K到内存，供回测按日切片。
+
+    回测要对每个交易日重建股池，若逐日调 get_daily_kline，同一只股票会被
+    不同 end_date 反复请求几十次。这里每只股票只取一次整段，之后全部走内存切片。
+    返回成功取到数据的股票数。
+    """
+    global _BULK_RANGE
+    if _BULK_RANGE != (start, end):
+        # 换区间就重取，否则旧区间的窄帧会被当成新区间的数据用
+        _BULK_KLINE.clear()
+        _BULK_RANGE = (start, end)
+    uniq = list(dict.fromkeys(str(c).zfill(6) for c in codes))
+    todo = [c for c in uniq if c not in _BULK_KLINE]
+    total = len(todo)
+    for i, code in enumerate(todo):
+        if progress_every and (i == 0 or (i + 1) % progress_every == 0):
+            print(f"  [{i+1}/{total}] 预取日K...")
+        _BULK_KLINE[code] = _fetch_kline_range(code, start, end)
+    return sum(1 for c in uniq if not _BULK_KLINE.get(c, pd.DataFrame()).empty)
+
+
+def slice_bulk_kline(code: str, days: int = 20, end_date=None) -> pd.DataFrame:
+    """从预取的整段日K中截取截止 end_date(含)的最后 days 根。"""
+    df = _BULK_KLINE.get(str(code).zfill(6))
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if end_date is None:
+        sub = df
+    else:
+        sub = df[df['日期'] <= pd.Timestamp(str(end_date))]
+    return sub.tail(days).reset_index(drop=True)
+
+
+def get_bulk_kline(code: str) -> pd.DataFrame:
+    """取预取的整段日K原始帧(回测模拟买卖时按日期定位用)。"""
+    return _BULK_KLINE.get(str(code).zfill(6), pd.DataFrame())
+
+
+def clear_bulk_klines():
+    """清空预取缓存。日K与策略参数无关，参数扫描跨轮可复用，不必每轮清。"""
+    global _BULK_RANGE
+    _BULK_KLINE.clear()
+    _BULK_RANGE = None
+
+
+def get_index_daily(symbol: str = "sh000300") -> pd.DataFrame:
+    """取指数日线，用作回测基准。"""
+    cache_key = f"{symbol}:{datetime.now().strftime('%Y%m%d')}"
+    cached = history_store.load_dataframe("index_daily", cache_key)
+    if not cached.empty:
+        df = cached
+    else:
+        df = _retry(ak.stock_zh_index_daily, symbol=symbol)
+        if df.empty:
+            return df
+        history_store.save_dataframe("index_daily", cache_key, df)
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    return df.sort_values('date').reset_index(drop=True)
 
 
 def get_realtime_quotes() -> pd.DataFrame:

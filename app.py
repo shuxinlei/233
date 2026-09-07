@@ -19,76 +19,96 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TASK_LOCK = threading.Lock()
 
 # 全局状态
+TASK_LABELS = {
+    'pre_market': '盘前筛选',
+    'intraday': '盘中扫描',
+    'backtest': '回测',
+}
 task_status = {
-    'pre_market': {'running': False, 'result': None, 'error': None, 'log': []},
-    'intraday': {'running': False, 'result': None, 'error': None, 'log': []},
+    name: {'running': False, 'result': None, 'error': None, 'log': []}
+    for name in TASK_LABELS
 }
 
 
-def _run_pre_market():
-    """后台运行盘前筛选"""
-    task_status['pre_market']['running'] = True
-    task_status['pre_market']['result'] = None
-    task_status['pre_market']['error'] = None
-    task_status['pre_market']['log'] = []
-    log = task_status['pre_market']['log']
+def _run_task(name, fn):
+    """
+    在后台线程里跑一个任务: 捕获 stdout 进日志、串行化、异常带 traceback 落日志。
+    fn 返回值作为该任务的 result。
+    """
+    st = task_status[name]
+    st['running'] = True
+    st['result'] = None
+    st['error'] = None
+    st['log'] = []
+    log = st['log']
 
     class LogCapture:
         def write(self, msg):
             if msg.strip():
                 log.append(msg.strip())
+
         def flush(self):
             pass
 
     try:
         with TASK_LOCK, redirect_stdout(LogCapture()):
-            from pre_market import build_stock_pool
-            pool = build_stock_pool()
-            task_status['pre_market']['result'] = {
-                'count': len(pool),
-                'stocks': [vars(s) for s in pool],
-                'time': datetime.now().strftime('%H:%M:%S'),
-            }
+            st['result'] = fn()
     except Exception as e:
         import traceback
         log.append(f'[错误] {e}')
         log.append(traceback.format_exc().strip())
-        task_status['pre_market']['error'] = str(e)
+        st['error'] = str(e)
     finally:
-        task_status['pre_market']['running'] = False
+        st['running'] = False
 
 
-def _run_intraday():
-    """后台运行盘中扫描"""
-    task_status['intraday']['running'] = True
-    task_status['intraday']['result'] = None
-    task_status['intraday']['error'] = None
-    task_status['intraday']['log'] = []
-    log = task_status['intraday']['log']
+def _start_task(name, fn):
+    """已在运行则拒绝，否则起后台线程。"""
+    if task_status[name]['running']:
+        return jsonify({'ok': False, 'msg': f'{TASK_LABELS[name]}正在运行中'}), 409
+    threading.Thread(target=_run_task, args=(name, fn), daemon=True).start()
+    return jsonify({'ok': True, 'msg': f'{TASK_LABELS[name]}已启动'})
 
-    class LogCapture:
-        def write(self, msg):
-            if msg.strip():
-                log.append(msg.strip())
-        def flush(self):
-            pass
 
-    try:
-        with TASK_LOCK, redirect_stdout(LogCapture()):
-            from intraday import scan
-            results = scan(datetime.now().strftime('%H:%M'))
-            task_status['intraday']['result'] = {
-                'count': len(results),
-                'results': [vars(r) for r in results],
-                'time': datetime.now().strftime('%H:%M:%S'),
-            }
-    except Exception as e:
-        import traceback
-        log.append(f'[错误] {e}')
-        log.append(traceback.format_exc().strip())
-        task_status['intraday']['error'] = str(e)
-    finally:
-        task_status['intraday']['running'] = False
+def _pre_market_task():
+    from pre_market import build_stock_pool
+    pool = build_stock_pool()
+    return {
+        'count': len(pool),
+        'stocks': [vars(s) for s in pool],
+        'time': datetime.now().strftime('%H:%M:%S'),
+    }
+
+
+def _intraday_task():
+    from intraday import scan
+    results = scan(datetime.now().strftime('%H:%M'))
+    return {
+        'count': len(results),
+        'results': [vars(r) for r in results],
+        'time': datetime.now().strftime('%H:%M:%S'),
+    }
+
+
+def _backtest_task(params):
+    """回测结果里 trades 可能上千行，状态接口只回摘要，明细去存档接口取。"""
+    import backtest
+    res = backtest.run_backtest(**params)
+    if not res:
+        return {'ok': False, 'msg': '区间内无交易日或无可回测标的',
+                'time': datetime.now().strftime('%H:%M:%S')}
+    return {
+        'ok': True,
+        'summary': res['summary'],
+        'metrics': {k: v for k, v in (res.get('metrics') or {}).items()
+                    if k != 'equity_curve'},
+        'equity_curve': (res.get('metrics') or {}).get('equity_curve', []),
+        'rank_buckets': res.get('rank_buckets', []),
+        'benchmark': res.get('benchmark'),
+        'skipped': res.get('skipped', {}),
+        'trade_count': len(res.get('trades', [])),
+        'time': datetime.now().strftime('%H:%M:%S'),
+    }
 
 
 # ==================== 路由 ====================
@@ -111,42 +131,58 @@ def get_pool():
 
 @app.route('/api/status')
 def get_status():
-    """获取任务状态"""
-    return jsonify({
-        'pre_market': {
-            'running': task_status['pre_market']['running'],
-            'result': task_status['pre_market']['result'],
-            'error': task_status['pre_market']['error'],
-            'log_tail': task_status['pre_market']['log'][-50:] if task_status['pre_market']['log'] else [],
-        },
-        'intraday': {
-            'running': task_status['intraday']['running'],
-            'result': task_status['intraday']['result'],
-            'error': task_status['intraday']['error'],
-            'log_tail': task_status['intraday']['log'][-50:] if task_status['intraday']['log'] else [],
-        },
-        'now': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-    })
+    """获取所有任务状态"""
+    payload = {
+        name: {
+            'running': st['running'],
+            'result': st['result'],
+            'error': st['error'],
+            'log_tail': st['log'][-50:],
+        }
+        for name, st in task_status.items()
+    }
+    payload['now'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return jsonify(payload)
 
 
 @app.route('/api/run/pre', methods=['POST'])
 def run_pre():
     """触发盘前筛选"""
-    if task_status['pre_market']['running']:
-        return jsonify({'ok': False, 'msg': '盘前筛选正在运行中'}), 409
-    t = threading.Thread(target=_run_pre_market, daemon=True)
-    t.start()
-    return jsonify({'ok': True, 'msg': '盘前筛选已启动'})
+    return _start_task('pre_market', _pre_market_task)
 
 
 @app.route('/api/run/intraday', methods=['POST'])
 def run_intraday():
     """触发盘中扫描"""
-    if task_status['intraday']['running']:
-        return jsonify({'ok': False, 'msg': '盘中扫描正在运行中'}), 409
-    t = threading.Thread(target=_run_intraday, daemon=True)
-    t.start()
-    return jsonify({'ok': True, 'msg': '盘中扫描已启动'})
+    return _start_task('intraday', _intraday_task)
+
+
+@app.route('/api/run/backtest', methods=['POST'])
+def run_backtest_route():
+    """触发盘前股池回测"""
+    import backtest
+    body = request.json or {}
+    start, end = body.get('start'), body.get('end')
+    if not start or not end:
+        return jsonify({'ok': False, 'msg': '需要 start 和 end (YYYYMMDD)'}), 400
+
+    params = {'start': str(start), 'end': str(end), 'verbose': True, 'save': True}
+    if body.get('exit_mode'):
+        if body['exit_mode'] not in backtest.EXIT_MODES:
+            return jsonify({'ok': False,
+                            'msg': f"exit_mode 需为 {list(backtest.EXIT_MODES)} 之一"}), 400
+        params['exit_mode'] = body['exit_mode']
+    for key, cast in (('hold_days', int), ('top_n', int),
+                      ('cost_pct', float), ('max_open_gap', float)):
+        if body.get(key) not in (None, ''):
+            try:
+                params[key] = cast(body[key])
+            except (TypeError, ValueError):
+                return jsonify({'ok': False, 'msg': f'{key} 取值非法'}), 400
+    if body.get('benchmark'):
+        params['benchmark'] = str(body['benchmark'])
+
+    return _start_task('backtest', lambda: _backtest_task(params))
 
 
 @app.route('/api/config', methods=['GET', 'POST'])
@@ -212,6 +248,20 @@ def get_history_detail(filename):
     """加载指定历史记录详情"""
     data = data_source.load_history(filename)
     return jsonify(data)
+
+
+@app.route('/api/backtest')
+def get_backtest_list():
+    """列出所有回测存档"""
+    import backtest
+    return jsonify(backtest.list_results())
+
+
+@app.route('/api/backtest/<filename>')
+def get_backtest_detail(filename):
+    """加载指定回测存档(含逐笔交易)"""
+    import backtest
+    return jsonify(backtest.load_result(filename))
 
 
 if __name__ == '__main__':

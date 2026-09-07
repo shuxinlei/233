@@ -263,10 +263,7 @@ def scan(scan_time_label):
             "created_at": datetime.now().isoformat(timespec='seconds'),
             "result_count": len(all_results),
             "results": [vars(r) for r in all_results],
-            "parameters": {
-                key: getattr(config, key) for key in dir(config)
-                if key.isupper() and isinstance(getattr(config, key), (int, float, str, bool, list))
-            },
+            "parameters": config.snapshot(),
         },
     )
     print(f"  {GREEN}历史存档: {hist_path}{RESET}")
