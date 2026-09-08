@@ -16,6 +16,7 @@ import sys
 from datetime import datetime, time as dt_time
 import config
 import data_source
+import error_monitor
 
 RED = '\033[91m'
 GREEN = '\033[92m'
@@ -63,7 +64,7 @@ def run_auto():
     if now.time() > _parse_time(config.PRE_MARKET_TIME):
         executed.add('pre')
         print(f"  {YELLOW}已过盘前时间({config.PRE_MARKET_TIME})，跳过盘前筛选{RESET}")
-        pool = data_source.load_pool()
+        pool, _dropped = data_source.apply_pool_constraints(data_source.load_pool())
         if pool:
             print(f"  {GREEN}检测到已有股池({len(pool)}只)，继续盘中扫描{RESET}")
     for st in config.SCAN_TIMES:
@@ -98,16 +99,23 @@ def run_auto():
             time.sleep(30)
     except KeyboardInterrupt:
         print(f"\n{YELLOW}程序已退出{RESET}\n")
+    except Exception as e:
+        error_monitor.log_exception("scheduler", e)
+        print(f"\n{RED}调度异常: {e}{RESET}\n")
 
 
 def run_manual(mode):
     """手动运行一次"""
-    if mode == 'pre':
-        from pre_market import build_stock_pool
-        build_stock_pool()
-    else:
-        from intraday import scan
-        scan(datetime.now().strftime('%H:%M'))
+    try:
+        if mode == 'pre':
+            from pre_market import build_stock_pool
+            build_stock_pool()
+        else:
+            from intraday import scan
+            scan(datetime.now().strftime('%H:%M'))
+    except Exception as e:
+        error_monitor.log_exception(f"manual_{mode}", e)
+        raise
 
 
 if __name__ == '__main__':

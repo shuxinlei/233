@@ -545,7 +545,7 @@ function renderScan(data) {
   }
   html += `<table><thead><tr>
     <th>代码</th><th>名称</th><th>板块</th><th>涨幅%</th><th>板块涨%</th>
-    <th>量比</th><th>换手%</th><th>涨停基因</th>
+    <th>量比</th><th>换手%</th><th>涨停基因</th><th>可介入</th>
     <th>板块涨</th><th>核心动</th><th>量能放</th><th>突破</th><th>共振</th>
   </tr></thead><tbody>`;
   data.results.forEach(r => {
@@ -559,6 +559,7 @@ function renderScan(data) {
       <td>${r.volume_ratio?.toFixed(1)}</td>
       <td>${r.turnover_rate?.toFixed(1)}</td>
       <td>${r.zt_gene}次</td>
+      <td style="color:${r.actionable?'var(--green)':(r.is_sealed_limit_up?'var(--red)':'var(--text-dim)')}">${r.entry_status||'-'}</td>
       <td>${cond(r.cond_sector)}</td>
       <td>${cond(r.cond_stock)}</td>
       <td>${cond(r.cond_volume)}</td>

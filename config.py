@@ -16,6 +16,7 @@ KLINE_DAYS = 20             # 量价结构回看天数
 RED_GREEN_RATIO = 1.5      # 阳线实体均值 / 阴线实体均值 的最小比值
 VOLUME_RATIO = 1.2          # 近5日均量 / 近20日均量 的最小比值
 TURNOVER_MIN = 3.0          # 最低换手率(%)
+TURNOVER_MAX = 20.0         # 盘前核心池最高换手率(%), 过高视为交易过热
 
 # ==================== 辨识度评分权重 ====================
 W_ZT_COUNT = 0.4            # 涨停次数
@@ -23,7 +24,7 @@ W_LIQUIDITY = 0.3           # 流动性(成交额)
 W_PRICE_VOLUME = 0.3        # 量价结构
 
 # 核心股池大小
-POOL_SIZE = 50
+POOL_SIZE = 20              # 核心池控制在可人工复核的范围内
 
 # 涨停基因池过大时，取评分前N只再做量价筛选(控制K线请求量)
 PV_SCAN_MAX = 200
@@ -46,9 +47,21 @@ BUY_STOCK_RISE_MIN = 5.0    # 个股最低涨幅(%)
 BUY_VOLUME_RATIO = 1.5      # 最低量比
 BUY_BREAK_MA5 = True       # 是否要求突破5日线
 
+# ==================== 可介入过滤 ====================
+EXCLUDE_SEALED_LIMIT_UP = True  # 封板状态不可直接买入，不标记为可介入
+SEALED_PRICE_TOLERANCE = 0.001  # 最新价距离当日最高价的容差
+
 # ==================== API调用 ====================
 API_RETRY = 3               # 失败重试次数
 API_DELAY = 0.3             # 调用间隔(秒)，防止频率过快被限制
+API_MIN_INTERVAL = 0.5      # 任意两次上游请求的最小间隔(秒)
+API_MAX_CALLS_PER_MINUTE = 90  # 单进程每分钟最多上游请求数
+PRE_TASK_COOLDOWN_SECONDS = 1800      # 盘前任务成功后的最短再次启动间隔
+INTRADAY_TASK_COOLDOWN_SECONDS = 60   # 盘中任务成功后的最短再次启动间隔
+BACKTEST_TASK_COOLDOWN_SECONDS = 300  # 回测任务成功后的最短再次启动间隔
+# 任务失败后只冷却很短时间: 盘前若因一次网络抖动失败而锁30分钟，
+# 会直接错过当天 09:25 的扫描窗口。
+FAILED_TASK_COOLDOWN_SECONDS = 60
 
 # ==================== 回测 ====================
 # 只回测盘前股池: 按日重建股池(仅用当日之前数据) → 模拟买卖 → 评估

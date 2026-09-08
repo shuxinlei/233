@@ -74,6 +74,20 @@ def load_dataframe(data_kind: str, data_key: str):
     return pd.DataFrame(records, columns=columns)
 
 
+def snapshot_fetched_at(data_kind: str, data_key: str):
+    """返回快照的抓取时间(ISO字符串)，不存在返回 None。
+
+    调用方据此判断快照是否已是最终版: 若抓取当天就是请求区间的结束日，
+    那一天的K线可能还没发布，快照并不真的覆盖到区间末尾。
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT fetched_at FROM api_snapshots WHERE data_kind = ? AND data_key = ?",
+            (data_kind, data_key),
+        ).fetchone()
+    return row[0] if row else None
+
+
 def save_strategy_result(run_kind: str, run_key: str, payload: dict):
     """保存一次策略运行结果，供回测评估和参数对比使用。"""
     with _connect() as conn:

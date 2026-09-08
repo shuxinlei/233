@@ -333,13 +333,22 @@ def run_backtest(start, end, exit_mode=None, hold_days=None, cost_pct=None,
 
     pre_dates = data_source.get_trading_dates(config.KLINE_DAYS + 10, end_date=bt_dates[0])
     fetch_start = pre_dates[0] if pre_dates else bt_dates[0]
-    # 卖出可能落在区间之后；上限压到今天，避免把"尚不存在的未来K线"写进快照缓存
-    tail_buffer = (max(1, hold_days) + 5) * 3
-    fetch_end_dt = min(
-        datetime.strptime(bt_dates[-1], '%Y%m%d') + timedelta(days=tail_buffer),
-        datetime.now(),
-    )
-    fetch_end = fetch_end_dt.strftime('%Y%m%d')
+
+    # 卖出K线最远落在最后一个入场日之后 need_tail 个交易日。
+    # 取"恰好够用"的那一天，而不是今天: kline_range 的缓存键含区间，
+    # 用今天会让键每天变一次，同一段历史区间的回测每天都要把整段日K重取一遍。
+    need_tail = 0 if exit_mode == 'same_close' else (
+        max(1, hold_days) if exit_mode == 'nday_close' else 1)
+    probe_end = (datetime.strptime(bt_dates[-1], '%Y%m%d')
+                 + timedelta(days=(need_tail + 5) * 3)).strftime('%Y%m%d')
+    tail_dates = data_source.get_trading_dates_between(bt_dates[-1], probe_end)
+    if len(tail_dates) > need_tail:
+        needed_end = tail_dates[need_tail]
+    else:
+        needed_end = tail_dates[-1] if tail_dates else bt_dates[-1]
+    # 需要的结束日还没到，说明尾部K线仍在产生，此时只能取到今天，
+    # 缓存键随之每天变化 —— 这是正确的，因为数据确实还在变。
+    fetch_end = min(needed_end, datetime.now().strftime('%Y%m%d'))
     log(f"\n{CYAN}Step 3: 预取日K {fetch_start} ~ {fetch_end}...{RESET}")
     ok = data_source.prefetch_klines(sorted(codes), fetch_start, fetch_end,
                                      progress_every=50 if verbose else 0)

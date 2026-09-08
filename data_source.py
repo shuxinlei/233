@@ -5,11 +5,14 @@
 import time
 import json
 import os
+import threading
+from collections import deque
 import numpy as np
 import akshare as ak
 import pandas as pd
 from datetime import datetime, timedelta
 import history_store
+import error_monitor
 
 
 class _NumpyJSONEncoder(json.JSONEncoder):
@@ -41,6 +44,9 @@ _BULK_KLINE = {}
 _BULK_RANGE = None
 # 交易日历(整个进程只取一次): 回测按日重建股池会反复查日历
 _TRADE_CAL = None
+_API_RATE_LOCK = threading.Lock()
+_API_CALL_TIMES = deque()
+_API_LAST_CALL = 0.0
 
 
 def _cache_sina_sector_map(df: pd.DataFrame, indicator: str):
@@ -51,11 +57,46 @@ def _cache_sina_sector_map(df: pd.DataFrame, indicator: str):
         ))
 
 
+def _wait_for_api_slot():
+    """全进程限频，所有 AkShare 请求共享一个节流器。"""
+    global _API_LAST_CALL
+    while True:
+        with _API_RATE_LOCK:
+            now = time.monotonic()
+            while _API_CALL_TIMES and now - _API_CALL_TIMES[0] >= 60:
+                _API_CALL_TIMES.popleft()
+            interval_wait = max(0.0, config.API_MIN_INTERVAL - (now - _API_LAST_CALL))
+            window_wait = 0.0
+            if len(_API_CALL_TIMES) >= config.API_MAX_CALLS_PER_MINUTE:
+                window_wait = max(0.0, 60 - (now - _API_CALL_TIMES[0]))
+            wait = max(interval_wait, window_wait)
+            if wait <= 0:
+                current = time.monotonic()
+                _API_LAST_CALL = current
+                _API_CALL_TIMES.append(current)
+                return
+        time.sleep(wait)
+
+
+def api_rate_status():
+    """返回限频器当前状态，供 Web 监控使用。"""
+    with _API_RATE_LOCK:
+        now = time.monotonic()
+        while _API_CALL_TIMES and now - _API_CALL_TIMES[0] >= 60:
+            _API_CALL_TIMES.popleft()
+        return {
+            "calls_last_minute": len(_API_CALL_TIMES),
+            "max_calls_per_minute": config.API_MAX_CALLS_PER_MINUTE,
+            "min_interval_seconds": config.API_MIN_INTERVAL,
+        }
+
+
 def _retry(func, *args, log_errors=True, attempts=None, **kwargs):
     """带重试的API调用"""
     retry_count = config.API_RETRY if attempts is None else attempts
     for i in range(retry_count):
         try:
+            _wait_for_api_slot()
             result = func(*args, **kwargs)
             time.sleep(config.API_DELAY)
             if result is None:
@@ -65,6 +106,12 @@ def _retry(func, *args, log_errors=True, attempts=None, **kwargs):
             if i < retry_count - 1:
                 time.sleep(config.API_DELAY * (i + 1) * 2)
             else:
+                error_monitor.log_exception(
+                    getattr(func, "__name__", repr(func)), e,
+                    {"args": [str(x)[:100] for x in args],
+                     "kwargs": {k: str(v)[:100] for k, v in kwargs.items()}},
+                    retry_count=retry_count,
+                )
                 if log_errors:
                     print(f"  [API错误] {e}")
                 return pd.DataFrame()
@@ -82,6 +129,7 @@ def _trade_calendar() -> pd.DatetimeIndex:
         try:
             df = ak.tool_trade_date_hist_sina()
         except Exception as e:
+            error_monitor.log_exception("trade_calendar", e)
             print(f"  [错误] 获取交易日历失败: {e}")
             return pd.DatetimeIndex([])
         history_store.save_dataframe("trade_calendar", cache_key, df)
@@ -154,6 +202,21 @@ _KLINE_COL_MAP = {
 }
 
 
+def _snapshot_is_final(data_kind: str, cache_key: str, end: str) -> bool:
+    """
+    判断日K快照是否已覆盖到请求区间的末尾。
+
+    缓存键里的 end 只是"请求"的结束日。若快照是在 end 当天(或更早)抓的，
+    那天的日K可能还没发布，帧的最后一根其实更早 —— 键承诺了它没有的覆盖范围。
+    只有抓取日晚于 end，数据才算最终版。
+    """
+    fetched_at = history_store.snapshot_fetched_at(data_kind, cache_key)
+    if not fetched_at:
+        return False
+    fetched_date = str(fetched_at)[:10].replace('-', '')
+    return fetched_date > str(end)
+
+
 def _normalize_kline(df: pd.DataFrame) -> pd.DataFrame:
     """统一列名，并把新浪的小数换手率(0.12=12%)转成百分比。"""
     if df.empty:
@@ -179,9 +242,10 @@ def get_daily_kline(symbol: str, days: int = 20, end_date=None) -> pd.DataFrame:
     end_dt = datetime.strptime(end, '%Y%m%d')
     start = (end_dt - timedelta(days=days * 2 + 10)).strftime('%Y%m%d')
     cache_key = f"{code}:{end}:{days}"
-    cached = history_store.load_dataframe("daily_kline", cache_key)
-    if not cached.empty:
-        return cached
+    if _snapshot_is_final("daily_kline", cache_key, end):
+        cached = history_store.load_dataframe("daily_kline", cache_key)
+        if not cached.empty:
+            return cached
     df = _retry(
         ak.stock_zh_a_daily,
         symbol=_to_sina_symbol(code), start_date=start, end_date=end, adjust="qfq"
@@ -198,7 +262,9 @@ def get_daily_kline(symbol: str, days: int = 20, end_date=None) -> pd.DataFrame:
 def _fetch_kline_range(code: str, start: str, end: str) -> pd.DataFrame:
     """取单只股票 [start, end] 整段日K，快照缓存按代码+区间存。"""
     cache_key = f"{code}:{start}:{end}"
-    df = history_store.load_dataframe("kline_range", cache_key)
+    df = pd.DataFrame()
+    if _snapshot_is_final("kline_range", cache_key, end):
+        df = history_store.load_dataframe("kline_range", cache_key)
     if df.empty:
         raw = _retry(
             ak.stock_zh_a_daily,
@@ -391,8 +457,9 @@ def get_board_constituents(board_name: str, board_type: str = "concept") -> pd.D
 POOL_FILE = os.path.join(BASE_DIR, "stock_pool.json")
 
 
-def save_pool(pool: list, filepath: str = POOL_FILE):
-    """保存核心股池到JSON"""
+def save_pool(pool: list, filepath: str = None):
+    """保存核心股池到JSON。filepath 默认在调用时解析，便于测试重定向。"""
+    filepath = filepath or POOL_FILE
     data = []
     for s in pool:
         d = {k: v for k, v in vars(s).items()}
@@ -401,14 +468,34 @@ def save_pool(pool: list, filepath: str = POOL_FILE):
         json.dump(data, f, ensure_ascii=False, indent=2, cls=_NumpyJSONEncoder)
 
 
-def load_pool(filepath: str = POOL_FILE) -> list:
-    """加载核心股池"""
+def load_pool(filepath: str = None) -> list:
+    """加载核心股池，原样返回存档内容。filepath 默认在调用时解析。"""
+    filepath = filepath or POOL_FILE
     if not os.path.exists(filepath):
         return []
     with open(filepath, 'r', encoding='utf-8') as f:
         data = json.load(f)
     from models import StockInfo
     return [StockInfo(**d) for d in data]
+
+
+def apply_pool_constraints(pool: list):
+    """
+    用当前配置约束股池，返回 (保留, 剔除)。
+
+    存档可能是参数收紧之前生成的，直接用会把过热标的带进盘中扫描。
+    但这一步刻意不放在 load_pool 里: 加载器静默改数据会让
+    stock_pool.json / history 存档 与 实际使用的股池 长期不一致且无从察觉。
+    独立成函数，调用方才能把剔除情况打出来。
+    股池按评分降序存储，所以截断保留的是评分最高的部分。
+    """
+    kept, dropped = [], []
+    for s in pool:
+        (dropped if s.turnover_rate > config.TURNOVER_MAX else kept).append(s)
+    if len(kept) > config.POOL_SIZE:
+        dropped.extend(kept[config.POOL_SIZE:])
+        kept = kept[:config.POOL_SIZE]
+    return kept, dropped
 
 
 # ==================== 历史数据存储 ====================

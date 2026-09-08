@@ -7,16 +7,24 @@ warnings.filterwarnings('ignore')
 
 import os
 import threading
+import time
 from contextlib import redirect_stdout
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 
 import config
 import data_source
+import error_monitor
 
 app = Flask(__name__, template_folder='templates')
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TASK_LOCK = threading.Lock()
+TASK_START_LOCK = threading.Lock()
+TASK_COOLDOWNS = {
+    'pre_market': 'PRE_TASK_COOLDOWN_SECONDS',
+    'intraday': 'INTRADAY_TASK_COOLDOWN_SECONDS',
+    'backtest': 'BACKTEST_TASK_COOLDOWN_SECONDS',
+}
 
 # 全局状态
 TASK_LABELS = {
@@ -28,6 +36,9 @@ task_status = {
     name: {'running': False, 'result': None, 'error': None, 'log': []}
     for name in TASK_LABELS
 }
+for _state in task_status.values():
+    # 冷却截止时间(time.monotonic 时钟)。任务结束时按成败改写。
+    _state['cooldown_until'] = 0.0
 
 
 def _run_task(name, fn):
@@ -57,15 +68,34 @@ def _run_task(name, fn):
         import traceback
         log.append(f'[错误] {e}')
         log.append(traceback.format_exc().strip())
+        error_monitor.log_exception(name, e)
         st['error'] = str(e)
     finally:
         st['running'] = False
+        # 失败只锁很短时间，成功才走完整冷却
+        cooldown = (config.FAILED_TASK_COOLDOWN_SECONDS if st['error']
+                    else getattr(config, TASK_COOLDOWNS[name]))
+        st['cooldown_until'] = time.monotonic() + cooldown
+        error_monitor.analyze_error_logs()
 
 
 def _start_task(name, fn):
-    """已在运行则拒绝，否则起后台线程。"""
-    if task_status[name]['running']:
-        return jsonify({'ok': False, 'msg': f'{TASK_LABELS[name]}正在运行中'}), 409
+    """原子检查运行状态和冷却时间后启动后台线程。"""
+    with TASK_START_LOCK:
+        st = task_status[name]
+        if st['running']:
+            return jsonify({'ok': False, 'msg': f'{TASK_LABELS[name]}正在运行中'}), 409
+        now = time.monotonic()
+        if now < st['cooldown_until']:
+            remaining = int(st['cooldown_until'] - now) + 1
+            return jsonify({
+                'ok': False,
+                'msg': f'{TASK_LABELS[name]}触发过于频繁，请{remaining}秒后再试',
+                'retry_after': remaining,
+            }), 429
+        st['running'] = True
+        # 先按完整冷却占位，任务结束时再按成败改写
+        st['cooldown_until'] = now + getattr(config, TASK_COOLDOWNS[name])
     threading.Thread(target=_run_task, args=(name, fn), daemon=True).start()
     return jsonify({'ok': True, 'msg': f'{TASK_LABELS[name]}已启动'})
 
@@ -121,9 +151,12 @@ def index():
 @app.route('/api/pool')
 def get_pool():
     """获取核心股池"""
-    pool = data_source.load_pool()
+    stored = data_source.load_pool()
+    pool, dropped = data_source.apply_pool_constraints(stored)
     return jsonify({
         'count': len(pool),
+        'stored_count': len(stored),
+        'dropped_count': len(dropped),
         'stocks': [vars(s) for s in pool],
         'time': datetime.now().strftime('%H:%M:%S'),
     })
@@ -132,17 +165,29 @@ def get_pool():
 @app.route('/api/status')
 def get_status():
     """获取所有任务状态"""
+    _now = time.monotonic()
     payload = {
         name: {
             'running': st['running'],
             'result': st['result'],
             'error': st['error'],
             'log_tail': st['log'][-50:],
+            'cooldown_remaining': max(0, int(st['cooldown_until'] - _now)),
         }
         for name, st in task_status.items()
     }
     payload['now'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    payload['api_rate'] = data_source.api_rate_status()
     return jsonify(payload)
+
+
+@app.route('/api/errors/report')
+def get_error_report():
+    """获取指定日期异常日报。"""
+    date_str = request.args.get('date')
+    if date_str and (len(date_str) != 8 or not date_str.isdigit()):
+        return jsonify({'ok': False, 'msg': 'date 需为 YYYYMMDD'}), 400
+    return jsonify(error_monitor.analyze_error_logs(date_str))
 
 
 @app.route('/api/run/pre', methods=['POST'])

@@ -31,6 +31,7 @@ trading_233/
 ├── backtest.py         # 盘前股池回测（按日重建 + 交易模拟 + 参数扫描）
 ├── data_source.py      # AkShare 数据源封装 + 历史数据存储
 ├── history_store.py    # SQLite 行情快照与策略结果存储（回测基础）
+├── error_monitor.py    # 按日异常日志与异常模式分析
 ├── indicators.py       # 技术指标（红绿比、量比、MA5等）
 ├── models.py           # 数据模型（StockInfo / SectorInfo / ScanResult）
 ├── config.py           # 策略参数集中配置
@@ -140,11 +141,14 @@ python backtest.py --start 20260818 --end 20260904 --sweep RED_GREEN_RATIO=1.0,1
 | `RED_GREEN_RATIO` | 1.5 | 红肥绿瘦最小比值 |
 | `VOLUME_RATIO` | 1.2 | 量比最小值 |
 | `TURNOVER_MIN` | 3.0% | 最低换手率 |
-| `POOL_SIZE` | 50 | 核心股池大小 |
+| `POOL_SIZE` | 20 | 核心股池大小（控制在可人工复核的范围内） |
 | `TOP_SECTOR_COUNT` | 8 | 取前N个板块 |
 | `STOCK_RISE_MIN` | 5.0% | 龙头确认最低涨幅 |
 | `STOCK_VOLUME_RATIO` | 1.5 | 龙头确认最低量比 |
+| `TURNOVER_MIN` / `TURNOVER_MAX` | 3% / 20% | 盘前换手率区间，过高视为交易过热 |
 | `PV_SCAN_MAX` | 200 | 涨停基因池过大时取前N只做量价筛选 |
+| `EXCLUDE_SEALED_LIMIT_UP` | True | 封板状态不计入可介入与四条件共振 |
+| `FAILED_TASK_COOLDOWN_SECONDS` | 60 | Web 任务失败后的冷却（成功走各自的完整冷却） |
 | `BT_EXIT_MODE` | next_open | 回测出场方式 |
 | `BT_COST_PCT` | 0.2% | 回测双边交易成本 |
 | `BT_MAX_OPEN_GAP` | 9.5% | 开盘涨幅超过该值视为一字板买不进 |
@@ -196,6 +200,12 @@ python backtest.py --start 20260818 --end 20260904 --sweep RED_GREEN_RATIO=1.0,1
 - **跳过的信号**：分原因统计（买不进 / 停牌 / 区间末尾缺卖出K线）
 
 结果存档到 `history/backtest/*.json`（含逐笔交易），摘要同时写入 `market_data.db` 的 `strategy_runs`，附当次参数快照。
+
+所有上游请求共享进程级限频器，默认两次请求至少间隔 `0.5` 秒、每分钟最多 `90` 次；缓存命中不会触发请求。Web 任务还有触发冷却：**成功后**盘前筛选默认 30 分钟、盘中扫描默认 60 秒、回测默认 5 分钟；**失败后只冷却 60 秒**（`FAILED_TASK_COOLDOWN_SECONDS`），避免一次网络抖动把盘前锁到错过当天扫描窗口。重复触发返回 `429` 和剩余等待秒数，`/api/status` 也会给出每个任务的 `cooldown_remaining`。
+
+日K快照按「代码+区间」缓存，并用抓取时间校验覆盖：若快照是在请求区间结束日当天抓的，那天的K线可能还没发布，快照会被判为非最终版并重取 —— 否则会拿到一份声称覆盖到某日、实际缺最后一根的帧。
+
+最终失败（重试过程只记录一条）会写入 `history/errors/YYYYMMDD.jsonl`。任务结束时自动更新异常汇总，也可运行 `python error_monitor.py --date YYYYMMDD` 或访问 `/api/errors/report?date=YYYYMMDD` 查看按接口、异常类型和错误模式聚合的日报。
 
 ### 数据可回溯范围（重要）
 

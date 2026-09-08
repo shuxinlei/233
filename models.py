@@ -46,6 +46,10 @@ class ScanResult:
     sector_change: float = 0.0     # 板块涨幅
     volume_ratio: float = 0.0      # 量比
     turnover_rate: float = 0.0     # 换手率
+    is_limit_up: bool = False      # 是否触及涨停价
+    is_sealed_limit_up: bool = False  # 是否封板，通常无法成交
+    actionable: bool = False       # 是否满足可介入条件
+    entry_status: str = ""         # 可介入/封板不可买/条件不足
     above_ma5: bool = False       # 是否突破5日线
     zt_gene: int = 0              # 涨停基因次数
     # 买点四条件

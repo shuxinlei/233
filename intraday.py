@@ -33,6 +33,43 @@ SCAN_MINUTES = {
 TOTAL_MINUTES = 240
 
 
+def _is_risk_warning(name) -> bool:
+    """
+    识别风险警示股。
+
+    A股同时存在 ST 与 *ST 两种前缀，且 *ST(退市风险警示)更常见，
+    只判 startswith('ST') 会把 *ST 全部漏掉 —— 这类股在5%涨停封板时
+    会被误标成可介入。部分数据源用全角星号，一并剥掉。
+    """
+    return str(name).upper().lstrip('*＊ 　').startswith('ST')
+
+
+def _limit_up_change(code, name=''):
+    """
+    按板块规则估算涨停涨幅阈值(%)。
+
+    先判板块再判风险警示: 创业板/科创板的风险警示股涨跌幅限制仍是20%，
+    只有主板的风险警示股才是5%。
+    """
+    code = str(code).zfill(6)
+    if code.startswith(('43', '83', '87', '92')):   # 北交所 30%
+        return 29.5
+    if code.startswith(('30', '68')):               # 创业板/科创板 20%(含风险警示股)
+        return 19.5
+    if _is_risk_warning(name):                      # 主板风险警示股 5%
+        return 4.8
+    return 9.5
+
+
+def _tradeability(code, name, change, price, high):
+    """识别封板状态；没有最高价时对触及涨停采取保守判断。"""
+    is_limit_up = change >= _limit_up_change(code, name)
+    if not is_limit_up:
+        return False, False
+    is_sealed = not high or price >= high * (1 - config.SEALED_PRICE_TOLERANCE)
+    return True, is_sealed
+
+
 def _calc_vol_ratio_proxy(current_amount, avg_5d_amount, scan_label):
     """
     量比代理值 = 今日成交额 / (5日平均成交额 × 已过分钟占比)
@@ -109,6 +146,7 @@ def _find_leaders(sector, pool, quotes, scan_label):
         change = float(q.get('涨跌幅', 0) or 0)
         amount = float(q.get('成交额', 0) or 0)
         price = float(q.get('最新价', 0) or 0)
+        high = float(q.get('最高', 0) or 0)
         # 换手率从板块成分股获取
         turnover = float(row.get('换手率', 0) or 0)
         # 量比代理值
@@ -121,6 +159,7 @@ def _find_leaders(sector, pool, quotes, scan_label):
             'volume_ratio': vol_ratio,
             'turnover': turnover,
             'price': price,
+            'high': high,
             'amount': amount,
             'zt_gene': si.zt_count
         })
@@ -151,6 +190,22 @@ def _check_buy_point(leader, sector, scan_label):
     c_vol = leader['volume_ratio'] >= (0.5 if is_auction else config.BUY_VOLUME_RATIO)
     c_brk = above_ma5 if config.BUY_BREAK_MA5 else True
 
+    is_limit_up, is_sealed = _tradeability(
+        leader['code'], leader['name'], leader['change'],
+        leader['price'], leader.get('high', 0)
+    )
+    conditions_ok = c_sec and c_stk and c_vol and c_brk
+    blocked = config.EXCLUDE_SEALED_LIMIT_UP and is_sealed
+    actionable = conditions_ok and not blocked
+    if blocked:
+        entry_status = '封板不可买'
+    elif actionable:
+        entry_status = '可介入'
+    elif is_limit_up:
+        entry_status = '涨停附近观察'
+    else:
+        entry_status = '条件不足'
+
     return ScanResult(
         scan_time=datetime.now().strftime('%H:%M'),
         stock_code=leader['code'], stock_name=leader['name'],
@@ -158,10 +213,14 @@ def _check_buy_point(leader, sector, scan_label):
         stock_change=leader['change'], sector_change=sector.change_pct,
         volume_ratio=leader['volume_ratio'],
         turnover_rate=leader['turnover'],
+        is_limit_up=is_limit_up,
+        is_sealed_limit_up=is_sealed,
+        actionable=actionable,
+        entry_status=entry_status,
         above_ma5=above_ma5, zt_gene=leader['zt_gene'],
         cond_sector=c_sec, cond_stock=c_stk,
         cond_volume=c_vol, cond_breakout=c_brk,
-        all_confirmed=c_sec and c_stk and c_vol and c_brk
+        all_confirmed=actionable
     )
 
 
@@ -171,9 +230,16 @@ def scan(scan_time_label):
     print(f"{BOLD}  盘中扫描 {scan_time_label} ({datetime.now().strftime('%H:%M:%S')}){RESET}")
     print(f"{BOLD}{'='*60}{RESET}")
 
-    pool = data_source.load_pool()
-    if not pool:
+    stored = data_source.load_pool()
+    if not stored:
         print(f"  {YELLOW}核心股池为空，请先运行盘前筛选 (python main.py --mode pre){RESET}")
+        return []
+    pool, dropped = data_source.apply_pool_constraints(stored)
+    if dropped:
+        print(f"  {YELLOW}存档{len(stored)}只，按当前参数剔除{len(dropped)}只"
+              f"(换手>{config.TURNOVER_MAX}% 或超出 POOL_SIZE={config.POOL_SIZE}){RESET}")
+    if not pool:
+        print(f"  {YELLOW}股池经当前参数过滤后为空，请重跑盘前筛选或放宽参数{RESET}")
         return []
     print(f"  核心股池: {len(pool)}只")
 
@@ -206,6 +272,7 @@ def scan(scan_time_label):
             '涨跌幅': float(row.get('涨跌幅', 0) or 0),
             '成交额': float(row.get('成交额', 0) or 0),
             '成交量': float(row.get('成交量', 0) or 0),
+            '最高': float(row.get('最高', 0) or 0),
         }
 
     # Step 2: 每个强势板块找龙头
@@ -231,19 +298,26 @@ def scan(scan_time_label):
 
     # 汇总
     if all_results:
-        print(f"\n{CYAN}[买点确认] 四条件共振{RESET}")
+        print(f"\n{CYAN}[买点确认] 四条件共振 + 可介入{RESET}")
+
+        def mark(b):
+            return 'Y' if b else 'N'
+
         brows = []
         for r in all_results:
-            def mark(b): return 'Y' if b else 'N'
-            star = ' ★' if r.all_confirmed else ''
+            # 共振列已含"可介入"，所以必须同时给出状态，否则会出现
+            # 四个Y却没有星号、且看不到原因的情况
+            star = '★' if r.all_confirmed else ''
             brows.append([r.stock_code, r.stock_name[:6],
                          mark(r.cond_sector), mark(r.cond_stock),
-                         mark(r.cond_volume), mark(r.cond_breakout), star])
-        print(tabulate(brows, headers=['代码', '名称', '板块涨', '核心动', '量能放', '突破MA5', '共振'], tablefmt='simple'))
+                         mark(r.cond_volume), mark(r.cond_breakout),
+                         r.entry_status or '-', star])
+        print(tabulate(brows, headers=['代码', '名称', '板块涨', '核心动', '量能放',
+                                       '突破MA5', '可介入', '共振'], tablefmt='simple'))
 
         confirmed = [r for r in all_results if r.all_confirmed]
         if confirmed:
-            print(f"\n{GREEN}{BOLD}>>> {len(confirmed)}只标的四条件共振确认 <<<{RESET}")
+            print(f"\n{GREEN}{BOLD}>>> {len(confirmed)}只标的四条件共振且可介入 <<<{RESET}")
             for r in confirmed:
                 print(f"  {GREEN}{r.stock_code} {r.stock_name} | "
                       f"板块:{r.sector_name}({r.sector_change:.1f}%) | "
@@ -251,6 +325,16 @@ def scan(scan_time_label):
                       f"涨停基因:{r.zt_gene}次{RESET}")
         else:
             print(f"\n{YELLOW}当前无共振确认，继续观察{RESET}")
+
+        # 四条件齐了但买不进的单独列出，否则这些标的在表里只是"少个星号"
+        blocked = [r for r in all_results
+                   if not r.all_confirmed and r.cond_sector and r.cond_stock
+                   and r.cond_volume and r.cond_breakout]
+        if blocked:
+            print(f"\n{YELLOW}四条件已满足但当前买不进 {len(blocked)}只:{RESET}")
+            for r in blocked:
+                print(f"  {YELLOW}{r.stock_code} {r.stock_name} | {r.entry_status} | "
+                      f"涨幅:{r.stock_change:.1f}% | 板块:{r.sector_name}{RESET}")
     else:
         print(f"\n{YELLOW}强势板块中无核心股池标的匹配{RESET}")
 
