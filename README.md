@@ -141,11 +141,10 @@ python backtest.py --start 20260818 --end 20260904 --sweep RED_GREEN_RATIO=1.0,1
 | `RED_GREEN_RATIO` | 1.5 | 红肥绿瘦最小比值 |
 | `VOLUME_RATIO` | 1.2 | 量比最小值 |
 | `TURNOVER_MIN` | 3.0% | 最低换手率 |
-| `POOL_SIZE` | 20 | 核心股池大小（控制在可人工复核的范围内） |
+| `POOL_SIZE` | 50 | 核心股池大小 |
 | `TOP_SECTOR_COUNT` | 8 | 取前N个板块 |
 | `STOCK_RISE_MIN` | 5.0% | 龙头确认最低涨幅 |
 | `STOCK_VOLUME_RATIO` | 1.5 | 龙头确认最低量比 |
-| `TURNOVER_MIN` / `TURNOVER_MAX` | 3% / 20% | 盘前换手率区间，过高视为交易过热 |
 | `PV_SCAN_MAX` | 200 | 涨停基因池过大时取前N只做量价筛选 |
 | `EXCLUDE_SEALED_LIMIT_UP` | True | 封板状态不计入可介入与四条件共振 |
 | `FAILED_TASK_COOLDOWN_SECONDS` | 60 | Web 任务失败后的冷却（成功走各自的完整冷却） |

@@ -93,7 +93,7 @@ def _filter_price_volume(stocks, end_date=None, verbose=True):
         tr = indicators.get_latest_turnover(kline)
         amt = indicators.get_latest_amount(kline)
         if (rg >= config.RED_GREEN_RATIO and vr >= config.VOLUME_RATIO
-                and config.TURNOVER_MIN <= tr <= config.TURNOVER_MAX):
+                and tr >= config.TURNOVER_MIN):
             s['red_green_ratio'] = rg
             s['volume_ratio'] = vr
             s['turnover_rate'] = tr
@@ -215,7 +215,7 @@ def compute_pool(as_of_date=None, verbose=True):
 
     _log(f"\n{CYAN}Step 3: 量价结构筛选...{RESET}", verbose)
     pv_stocks = _filter_price_volume(zt_stocks, end_date=dates[-1], verbose=verbose)
-    _log(f"  通过量价筛选: {len(pv_stocks)}只（换手率 {config.TURNOVER_MIN}%-{config.TURNOVER_MAX}%）", verbose)
+    _log(f"  通过量价筛选: {len(pv_stocks)}只（换手率 >= {config.TURNOVER_MIN}%）", verbose)
     stats['pv_pass_count'] = len(pv_stocks)
 
     _log(f"\n{CYAN}Step 4: 辨识度评分...{RESET}", verbose)

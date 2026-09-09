@@ -483,17 +483,15 @@ def apply_pool_constraints(pool: list):
     """
     用当前配置约束股池，返回 (保留, 剔除)。
 
-    存档可能是参数收紧之前生成的，直接用会把过热标的带进盘中扫描。
+    存档可能超过当前核心池大小，直接使用会让盘中扫描超出人工复核范围。
     但这一步刻意不放在 load_pool 里: 加载器静默改数据会让
     stock_pool.json / history 存档 与 实际使用的股池 长期不一致且无从察觉。
     独立成函数，调用方才能把剔除情况打出来。
     股池按评分降序存储，所以截断保留的是评分最高的部分。
     """
-    kept, dropped = [], []
-    for s in pool:
-        (dropped if s.turnover_rate > config.TURNOVER_MAX else kept).append(s)
+    kept, dropped = list(pool), []
     if len(kept) > config.POOL_SIZE:
-        dropped.extend(kept[config.POOL_SIZE:])
+        dropped = kept[config.POOL_SIZE:]
         kept = kept[:config.POOL_SIZE]
     return kept, dropped
 

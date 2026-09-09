@@ -237,7 +237,7 @@ def scan(scan_time_label):
     pool, dropped = data_source.apply_pool_constraints(stored)
     if dropped:
         print(f"  {YELLOW}存档{len(stored)}只，按当前参数剔除{len(dropped)}只"
-              f"(换手>{config.TURNOVER_MAX}% 或超出 POOL_SIZE={config.POOL_SIZE}){RESET}")
+              f"(超出 POOL_SIZE={config.POOL_SIZE}){RESET}")
     if not pool:
         print(f"  {YELLOW}股池经当前参数过滤后为空，请重跑盘前筛选或放宽参数{RESET}")
         return []
